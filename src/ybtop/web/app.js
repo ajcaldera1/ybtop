@@ -148,7 +148,7 @@
   let ashNodeIdFilter = null;
   let ashTableIdFilter = null;
 
-  const VIEWER_SECTION_IDS = ["pgss", "ycql", "ash", "tablets"];
+  const VIEWER_SECTION_IDS = ["pgss", "ycql", "ash", "tablets", "latency"];
 
   /**
    * subsectionId -> expanded when true; undefined / false => collapsed.
@@ -198,7 +198,13 @@
     const t = p.get("t");
     urlWindowKey = t != null && String(t).trim() !== "" ? String(t).trim() : null;
     const v = p.get("view");
-    if (v === "ash" || v === "tablets" || v === "pgss" || v === "ycql") {
+    if (
+      v === "ash" ||
+      v === "tablets" ||
+      v === "pgss" ||
+      v === "ycql" ||
+      v === "latency"
+    ) {
       activeViewerSection = v;
     } else {
       activeViewerSection = "pgss";
@@ -296,6 +302,11 @@
       ["ash", "Active Session History"],
       ["tablets", "Tablet Report"],
     ];
+    if (docHasLatencyHistograms(lastDoc)) {
+      items.push(["latency", "Latency modes"]);
+    } else if (activeViewerSection === "latency") {
+      activeViewerSection = "pgss";
+    }
     items.forEach(([sid, label]) => {
       const btn = el("button", {
         type: "button",
@@ -3150,6 +3161,638 @@
     return section;
   }
 
+  // ------------------------------------------------------------------------------------
+  // Latency-histogram multimodality (browser port of histogram.py / histogram_detect.py).
+  // Stages 0-2 + template grouping run here; the Hartigan dip test (Stage 3) needs the
+  // native diptest package and is skipped in the browser, so shape-flagged rows land in the
+  // "unconfirmed" tier. The Python CLI (ybtop histogram) runs the dip test when installed.
+  // Thresholds are kept identical to the Python detector.
+  // ------------------------------------------------------------------------------------
+  const HIST_TIER_RANK = {
+    not_flagged: 0,
+    unconfirmed: 1,
+    moderate: 2,
+    high: 3,
+    very_high: 4,
+  };
+
+  function docHasLatencyHistograms(doc) {
+    const pn = doc && doc.latency_histograms && doc.latency_histograms.per_node;
+    if (!pn || typeof pn !== "object") return false;
+    return Object.keys(pn).some((nid) => Array.isArray(pn[nid]) && pn[nid].length > 0);
+  }
+
+  function histCoerceBuckets(raw) {
+    const out = {};
+    if (!raw) return out;
+    const add = (k, v) => {
+      const c = Number(v);
+      if (Number.isFinite(c)) out[k] = (out[k] || 0) + c;
+    };
+    if (Array.isArray(raw)) {
+      raw.forEach((o) => {
+        if (o && typeof o === "object") Object.entries(o).forEach(([k, v]) => add(k, v));
+      });
+    } else if (typeof raw === "object") {
+      Object.entries(raw).forEach(([k, v]) => add(k, v));
+    }
+    return out;
+  }
+
+  function histMergeKey(r) {
+    const db = r.dbname == null ? "" : String(r.dbname).trim();
+    return `${r.queryid == null ? "" : String(r.queryid)}\0${db}`;
+  }
+
+  function mergeLatencyHistograms(perNode) {
+    const acc = new Map();
+    Object.keys(perNode || {}).forEach((nid) => {
+      (perNode[nid] || []).forEach((r) => {
+        const mk = histMergeKey(r);
+        if (!acc.has(mk)) {
+          acc.set(mk, {
+            queryid: String(r.queryid),
+            dbname:
+              r.dbname != null && String(r.dbname).trim() !== ""
+                ? String(r.dbname).trim()
+                : null,
+            query: r.query || "",
+            calls: 0,
+            buckets: {},
+          });
+        }
+        const a = acc.get(mk);
+        a.calls += Number(r.calls) || 0;
+        const b = histCoerceBuckets(r.yb_latency_histogram);
+        Object.entries(b).forEach(([k, v]) => {
+          a.buckets[k] = (a.buckets[k] || 0) + v;
+        });
+        if (!a.query && r.query) a.query = r.query;
+      });
+    });
+    const out = Array.from(acc.values());
+    out.sort((x, y) => y.calls - x.calls);
+    return out;
+  }
+
+  function deltaLatencyHistograms(cur, prev) {
+    const pm = new Map((prev || []).map((r) => [histMergeKey(r), r]));
+    const out = [];
+    (cur || []).forEach((c) => {
+      const p = pm.get(histMergeKey(c));
+      const db = {};
+      let has = false;
+      Object.entries(c.buckets).forEach(([k, v]) => {
+        const d = v - ((p && p.buckets[k]) || 0);
+        if (d > 0) {
+          db[k] = d;
+          has = true;
+        }
+      });
+      if (!has) return;
+      const dcalls = c.calls - ((p && p.calls) || 0);
+      out.push({
+        queryid: c.queryid,
+        dbname: c.dbname,
+        query: c.query,
+        calls: Math.max(0, dcalls),
+        buckets: db,
+      });
+    });
+    out.sort((x, y) => y.calls - x.calls);
+    return out;
+  }
+
+  const HIST_BUCKET_RE = /[[(]\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\s*,\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)?\s*[)\]]/;
+
+  // Parse a flat {bucket_label: count} map into sorted {low, high, count} rows plus the
+  // open-ended "[max,)" overflow count (no finite width -> excluded from peak finding),
+  // mirroring the Python parse_histogram_buckets().
+  function parseHistogramBuckets(buckets) {
+    const rows = [];
+    let overflow = 0;
+    Object.entries(buckets || {}).forEach(([k, v]) => {
+      const c = Number(v);
+      if (!Number.isFinite(c) || c === 0) return;
+      const m = String(k).match(HIST_BUCKET_RE);
+      if (!m) return;
+      const low = parseFloat(m[1]);
+      if (!Number.isFinite(low)) return;
+      if (m[2] == null || m[2] === "") {
+        overflow += c;
+        return;
+      }
+      const high = parseFloat(m[2]);
+      if (!Number.isFinite(high)) return;
+      rows.push({ low: low, high: high, count: c });
+    });
+    rows.sort((a, b) => a.low - b.low);
+    return { buckets: rows, overflow: overflow };
+  }
+
+  // Arithmetic bucket midpoint taken in log2(ms) space (matches the Python _log2_mid).
+  function log2Mid(low, high) {
+    return Math.log2(Math.max((low + high) / 2, 1e-3));
+  }
+
+  // Sarle's (uncorrected) BC over weighted log2(ms) midpoints. Returns null when fewer than
+  // 30 weighted samples back the estimate, matching the Python _bimodality_coefficient.
+  function bimodalityCoefficient(xs, ws) {
+    let n = 0;
+    for (let i = 0; i < ws.length; i++) n += ws[i];
+    if (n < 30) return null;
+    let mean = 0;
+    for (let i = 0; i < xs.length; i++) mean += ws[i] * xs[i];
+    mean /= n;
+    let m2 = 0;
+    let m3 = 0;
+    let m4 = 0;
+    for (let i = 0; i < xs.length; i++) {
+      const d = xs[i] - mean;
+      const w = ws[i];
+      const d2 = d * d;
+      m2 += w * d2;
+      m3 += w * d2 * d;
+      m4 += w * d2 * d2;
+    }
+    m2 /= n;
+    m3 /= n;
+    m4 /= n;
+    const std = Math.sqrt(m2);
+    if (std === 0) return 0;
+    const skew = m3 / Math.pow(m2, 1.5);
+    const kurt = m4 / (m2 * m2);
+    if (kurt <= 0) return null;
+    return (skew * skew + 1) / kurt;
+  }
+
+  function gaussianKernel1d(sigma, radius) {
+    const k = [];
+    let s = 0;
+    for (let i = -radius; i <= radius; i++) {
+      const v = Math.exp(-(i * i) / (2 * sigma * sigma));
+      k.push(v);
+      s += v;
+    }
+    return k.map((v) => v / s);
+  }
+
+  function gaussianFilter1d(arr, sigma) {
+    const radius = Math.max(1, Math.round(4 * sigma)); // scipy truncate=4.0, mode="reflect"
+    const k = gaussianKernel1d(sigma, radius);
+    const n = arr.length;
+    const out = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) {
+      let acc = 0;
+      for (let j = -radius; j <= radius; j++) {
+        let idx = i + j;
+        // scipy "reflect" (half-sample symmetric): (d c b a | a b c d | d c b a).
+        if (n > 0) {
+          while (idx < 0 || idx >= n) {
+            if (idx < 0) idx = -idx - 1;
+            else if (idx >= n) idx = 2 * n - idx - 1;
+          }
+        } else {
+          idx = 0;
+        }
+        acc += arr[idx] * k[j + radius];
+      }
+      out[i] = acc;
+    }
+    return out;
+  }
+
+  function peakProminence(y, p) {
+    const h = y[p];
+    const n = y.length;
+    let leftMin = Infinity;
+    for (let l = p - 1; l >= 0 && y[l] < h; l--) leftMin = Math.min(leftMin, y[l]);
+    let rightMin = Infinity;
+    for (let r = p + 1; r < n && y[r] < h; r++) rightMin = Math.min(rightMin, y[r]);
+    if (leftMin === Infinity) leftMin = h;
+    if (rightMin === Infinity) rightMin = h;
+    return h - Math.max(leftMin, rightMin);
+  }
+
+  function findPeaks(y, prominence, distance) {
+    const n = y.length;
+    const raw = [];
+    for (let i = 1; i < n - 1; i++) {
+      if (y[i] > y[i - 1] && y[i] >= y[i + 1]) raw.push(i);
+    }
+    let cand = raw.map((idx) => ({ idx, prom: peakProminence(y, idx) }));
+    if (prominence != null) cand = cand.filter((o) => o.prom >= prominence);
+    // Enforce min distance: keep taller peaks first, drop close-by lower peaks.
+    cand.sort((a, b) => y[b.idx] - y[a.idx]);
+    const removed = new Set();
+    const kept = [];
+    cand.forEach((o) => {
+      if (removed.has(o.idx)) return;
+      kept.push(o.idx);
+      cand.forEach((o2) => {
+        if (o2.idx !== o.idx && Math.abs(o2.idx - o.idx) < distance) removed.add(o2.idx);
+      });
+    });
+    kept.sort((a, b) => a - b);
+    return kept;
+  }
+
+  function histTierOf(r) {
+    if (!r.flag) return "not_flagged";
+    if (r.dip_p == null) return "unconfirmed";
+    if (r.dip_p <= 0.001) return "very_high";
+    if (r.dip_p <= 0.01) return "high";
+    return "moderate";
+  }
+
+  const round4 = (v) => Math.round(v * 10000) / 10000;
+
+  function detectModesJS(bucketMap, opts) {
+    const o = opts || {};
+    const minCalls = o.minCalls == null ? 30 : o.minCalls;
+    const bcThreshold = o.bcThreshold == null ? 0.555 : o.bcThreshold;
+    const minOctaveSeparation = o.minOctaveSeparation == null ? 0.5 : o.minOctaveSeparation;
+    const minValleyRatio = o.minValleyRatio == null ? 0.75 : o.minValleyRatio;
+    const overflowRatioThreshold = o.overflowRatioThreshold == null ? 0.02 : o.overflowRatioThreshold;
+
+    const parsed = parseHistogramBuckets(bucketMap);
+    const buckets = parsed.buckets;
+    const overflow = parsed.overflow;
+    const total = buckets.reduce((s, r) => s + r.count, 0) + overflow;
+    const res = {
+      calls: buckets.reduce((s, r) => s + r.count, 0),
+      flag: false,
+      reason: "",
+      bc: null,
+      dip_p: null,
+      n_raw_peaks: 0,
+      n_modes_estimate: null,
+      latency_min_ms: null,
+      latency_max_ms: null,
+      latency_spread_ratio: null,
+      peak_pairs: [],
+      overflow_count: overflow,
+      overflow_ratio: total ? overflow / total : 0,
+      overflow_flag: total ? overflow / total > overflowRatioThreshold && total >= minCalls : false,
+      confidence_tier: "not_flagged",
+    };
+
+    if (buckets.length) {
+      const latMin = Math.min(...buckets.map((r) => r.low));
+      const latMax = Math.max(...buckets.map((r) => r.high));
+      res.latency_min_ms = round4(latMin);
+      res.latency_max_ms = round4(latMax);
+      res.latency_spread_ratio = latMin > 0 ? round4(latMax / latMin) : null;
+    }
+
+    if (res.calls < minCalls) {
+      res.reason = "insufficient_calls";
+      res.confidence_tier = histTierOf(res);
+      return res;
+    }
+
+    const mids = buckets.map((r) => log2Mid(r.low, r.high));
+    const counts = buckets.map((r) => r.count);
+
+    const bc = bimodalityCoefficient(mids, counts);
+    res.bc = bc;
+    if (bc == null || bc < bcThreshold) {
+      res.reason = "bc_below_threshold";
+      res.confidence_tier = histTierOf(res);
+      return res;
+    }
+
+    // Stage 1 - width-normalized density in log2(ms) space.
+    const rawWidths = buckets.map((r) => (r.low > 0 ? Math.log2(r.high) - Math.log2(r.low) : Math.log2(r.high)));
+    const positive = rawWidths.filter((w) => w > 0);
+    const fallbackWidth = positive.length ? Math.min(...positive) : 1;
+    const widths = rawWidths.map((w) => (w > 0 ? w : fallbackWidth));
+    let density = counts.map((c, i) => c / widths[i]);
+    const dsum = density.reduce((s, d) => s + d, 0);
+    if (dsum > 0) density = density.map((d) => d / dsum);
+
+    const smoothed = gaussianFilter1d(density, 1.0);
+    const diffs = [];
+    for (let i = 1; i < mids.length; i++) diffs.push(mids[i] - mids[i - 1]);
+    const avgSpacing = diffs.length ? diffs.reduce((s, d) => s + d, 0) / diffs.length : 1;
+    const distance = Math.max(1, Math.round(minOctaveSeparation / Math.max(avgSpacing, 1e-6)));
+    const maxS = Math.max(...smoothed);
+    const prominence = maxS > 0 ? 0.03 * maxS : null;
+    const peaks = findPeaks(smoothed, prominence, distance);
+    res.n_raw_peaks = peaks.length;
+    if (peaks.length < 2) {
+      res.reason = "single_peak_after_smoothing";
+      res.confidence_tier = histTierOf(res);
+      return res;
+    }
+
+    // Stage 2 - keep every valid adjacent peak pair (raw-count valley check).
+    const validPairs = [];
+    for (let i = 0; i < peaks.length - 1; i++) {
+      const p1 = peaks[i];
+      const p2 = peaks[i + 1];
+      if (mids[p2] - mids[p1] < minOctaveSeparation) continue;
+      let valley = Infinity;
+      for (let k = p1; k <= p2; k++) valley = Math.min(valley, counts[k]);
+      const smaller = Math.min(counts[p1], counts[p2]);
+      if (smaller <= 0) continue;
+      if (valley / smaller > minValleyRatio) continue;
+      const peak1ms = Math.pow(2, mids[p1]);
+      const peak2ms = Math.pow(2, mids[p2]);
+      validPairs.push({
+        peak1_ms: round4(peak1ms),
+        peak2_ms: round4(peak2ms),
+        valley_ratio: round4(valley / smaller),
+        gap_ms: round4(peak2ms - peak1ms),
+        gap_ratio: peak1ms > 0 ? round4(peak2ms / peak1ms) : null,
+      });
+    }
+    if (!validPairs.length) {
+      res.reason = "no_significant_valley";
+      res.confidence_tier = histTierOf(res);
+      return res;
+    }
+    res.flag = true;
+    res.peak_pairs = validPairs;
+    res.n_modes_estimate = peaks.length;
+    res.dip_p = null; // Stage 3 dip test not available in the browser
+    res.confidence_tier = histTierOf(res);
+    return res;
+  }
+
+  // Primary signal dip_p ascending (rows without a dip_p sort to the back at 1.0);
+  // tiebreaker bc descending. Matches the Python rank_by_confidence.
+  function rankByConfidence(results) {
+    const ordered = results.slice().sort((a, b) => {
+      const da = a.dip_p == null ? 1 : a.dip_p;
+      const db = b.dip_p == null ? 1 : b.dip_p;
+      if (da !== db) return da - db;
+      return (b.bc || 0) - (a.bc || 0);
+    });
+    ordered.forEach((r, i) => {
+      r.confidence_rank = i + 1;
+    });
+    return ordered;
+  }
+
+  const HIST_REWRITE_COMMENT_RE = /\/\*[\s\S]*?\*\//g;
+  const HIST_IN_LIST_RE = /\bIN\s*\([^)]*\)/gi;
+  const HIST_PLACEHOLDER_RE = /\$\d+/g;
+
+  function normalizeQueryTemplate(query) {
+    if (!query) return "";
+    let q = String(query).replace(HIST_REWRITE_COMMENT_RE, "");
+    q = q.replace(HIST_IN_LIST_RE, "IN (...)");
+    q = q.replace(HIST_PLACEHOLDER_RE, "$N");
+    q = q.replace(/\s+/g, " ").trim();
+    return q;
+  }
+
+  function groupByTemplate(results) {
+    const groups = new Map();
+    results.forEach((r) => {
+      const key = normalizeQueryTemplate(r.query);
+      r.query_template = key;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    const summaries = [];
+    groups.forEach((members, key) => {
+      members.sort((a, b) => (a.confidence_rank || 1e9) - (b.confidence_rank || 1e9));
+      members.forEach((r, i) => {
+        r.template_rank = i + 1;
+        r.template_member_count = members.length;
+      });
+      const best = members[0];
+      const peakSet = new Set();
+      members.forEach((r) => {
+        if (r.n_raw_peaks) peakSet.add(r.n_raw_peaks);
+      });
+      // Primary peak-pair gap (ms / ratio) across members that reached the peak-pair stage.
+      const gapMs = [];
+      const gapRatio = [];
+      members.forEach((r) => {
+        if (r.peak_pairs && r.peak_pairs.length) {
+          gapMs.push(r.peak_pairs[0].gap_ms);
+          if (r.peak_pairs[0].gap_ratio != null) gapRatio.push(r.peak_pairs[0].gap_ratio);
+        }
+      });
+      summaries.push({
+        template: key,
+        member_count: members.length,
+        best_confidence_rank: best.confidence_rank || 0,
+        best_confidence_tier: best.confidence_tier || "not_flagged",
+        queryids: members.map((r) => r.queryid),
+        peak_counts: Array.from(peakSet).sort((a, b) => a - b),
+        gap_ms_range: gapMs.length ? [Math.min(...gapMs), Math.max(...gapMs)] : null,
+        gap_ratio_range: gapRatio.length ? [Math.min(...gapRatio), Math.max(...gapRatio)] : null,
+      });
+    });
+    summaries.sort(
+      (a, b) => (a.best_confidence_rank || 1e9) - (b.best_confidence_rank || 1e9)
+    );
+    return summaries;
+  }
+
+  function analyzeLatencyDoc(doc, prevDoc) {
+    const cur = mergeLatencyHistograms(doc.latency_histograms.per_node);
+    const prevHas = docHasLatencyHistograms(prevDoc);
+    const mode = prevHas ? "delta" : "cumulative";
+    let rows;
+    if (mode === "delta") {
+      const prev = mergeLatencyHistograms(prevDoc.latency_histograms.per_node);
+      rows = deltaLatencyHistograms(cur, prev);
+    } else {
+      rows = cur;
+    }
+    const results = rows.map((r) => {
+      const res = detectModesJS(r.buckets, { minCalls: 30 });
+      res.queryid = r.queryid;
+      res.query = r.query;
+      res.dbname = r.dbname;
+      if (!res.calls) res.calls = r.calls;
+      return res;
+    });
+    // Ranking and template grouping are deferred to the panel so they run over the
+    // currently-displayed (filtered) rows, matching the Python report ordering.
+    return { mode, results };
+  }
+
+  function histFmt(v, digits) {
+    if (v == null) return "";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return String(v);
+    return n.toFixed(digits == null ? 2 : digits);
+  }
+
+  function histSpreadStr(r) {
+    if (r.latency_min_ms == null || r.latency_max_ms == null) return "";
+    const rt = r.latency_spread_ratio != null ? `(x${histFmt(r.latency_spread_ratio, 1)})` : "";
+    return `${histFmt(r.latency_min_ms)}-${histFmt(r.latency_max_ms)}ms${rt}`;
+  }
+
+  function histGapStr(r) {
+    if (!r.peak_pairs || !r.peak_pairs.length) return "";
+    const pp = r.peak_pairs[0];
+    const rt = pp.gap_ratio != null ? `(x${histFmt(pp.gap_ratio, 1)})` : "";
+    return `${histFmt(pp.peak1_ms)}->${histFmt(pp.peak2_ms)}ms${rt}`;
+  }
+
+  function renderLatencyPanel(panel, doc, prevDoc) {
+    const analysis = analyzeLatencyDoc(doc, prevDoc);
+    const state = { minTier: "high", flaggedOnly: false };
+
+    const banner = el("div", { className: "pgss-activity-banner latency-banner" });
+    const modeLabel = analysis.mode === "delta" ? "Δ vs prior snapshot" : "cumulative totals";
+    banner.appendChild(
+      el("div", {
+        className: "latency-banner-title",
+        textContent: `Latency multimodality — ${modeLabel}`,
+      })
+    );
+    banner.appendChild(
+      el("div", {
+        className: "pgss-activity-note",
+        textContent:
+          "Browser detection runs Stages 0-2 (bimodality coefficient, peak finding, valley " +
+          "check) + query-template grouping. The confirmatory Hartigan dip test is not " +
+          "available in the browser, so shape-flagged queries are reported as 'unconfirmed'. " +
+          "Run 'ybtop histogram' (with the [histogram] extra) for dip-test confirmation and " +
+          "FDR-corrected tiers.",
+      })
+    );
+    panel.appendChild(banner);
+
+    const controls = el("div", { className: "latency-controls" });
+    const tierWrap = el("label", { className: "latency-control" });
+    tierWrap.appendChild(el("span", { textContent: "min tier:" }));
+    const tierSel = el("select");
+    [
+      ["very_high", "very_high"],
+      ["high", "high"],
+      ["moderate", "moderate"],
+      ["unconfirmed", "unconfirmed"],
+      ["all", "all"],
+    ].forEach(([val, label]) => {
+      const opt = el("option", { value: val, textContent: label });
+      if (val === state.minTier) opt.setAttribute("selected", "selected");
+      tierSel.appendChild(opt);
+    });
+    tierWrap.appendChild(tierSel);
+    controls.appendChild(tierWrap);
+
+    const flagWrap = el("label", { className: "latency-control" });
+    const flagChk = el("input", { type: "checkbox" });
+    flagWrap.appendChild(flagChk);
+    flagWrap.appendChild(el("span", { textContent: "flagged only" }));
+    controls.appendChild(flagWrap);
+    panel.appendChild(controls);
+
+    const groupHolder = el("div");
+    const tableHolder = el("div");
+    panel.appendChild(groupHolder);
+    panel.appendChild(tableHolder);
+
+    function rerender() {
+      let rows = analysis.results.slice();
+      if (state.flaggedOnly) rows = rows.filter((r) => r.flag);
+      if (state.minTier !== "all") {
+        const th = HIST_TIER_RANK[state.minTier] || 0;
+        rows = rows.filter((r) => (HIST_TIER_RANK[r.confidence_tier] || 0) >= th);
+      }
+      // Rank + group over the filtered rows so ranks and template rollups describe
+      // exactly what's shown (matches the Python report ordering).
+      rows = rankByConfidence(rows);
+      const groups = groupByTemplate(rows);
+
+      const displayRows = rows.map((r) => ({
+        tier: r.confidence_tier,
+        rank: r.confidence_rank,
+        calls: r.calls,
+        bc: r.bc != null ? round4(r.bc) : "",
+        dip_p: "—",
+        peaks: r.n_raw_peaks,
+        spread: histSpreadStr(r),
+        gap: histGapStr(r),
+        tmpl: r.template_member_count > 1 ? `${r.template_rank}/${r.template_member_count}` : "",
+        queryid: r.queryid,
+        query: r.query,
+      }));
+      const cols = [
+        { key: "tier", label: "tier", type: "number", sortValue: (r) => HIST_TIER_RANK[r.tier] || 0 },
+        { key: "rank", label: "rank", type: "number", align: "right" },
+        { key: "calls", label: "calls", type: "number", align: "right" },
+        { key: "bc", label: "bc", type: "number", align: "right" },
+        { key: "dip_p", label: "dip_p", align: "right" },
+        { key: "peaks", label: "peaks", type: "number", align: "right" },
+        { key: "spread", label: "spread" },
+        { key: "gap", label: "gap" },
+        { key: "tmpl", label: "tmpl" },
+        { key: "queryid", label: "queryid" },
+        { key: "query", label: "query" },
+      ];
+      tableHolder.textContent = "";
+      const total = analysis.results.length;
+      const flaggedN = analysis.results.filter((r) => r.flag).length;
+      tableHolder.appendChild(
+        buildSortableTable(
+          `Latency modes — ${displayRows.length} shown (${flaggedN} flagged / ${total} analyzed)`,
+          displayRows,
+          cols,
+          "sec-latency-main"
+        )
+      );
+
+      const recurring = groups.filter((g) => g.member_count > 1);
+      groupHolder.textContent = "";
+      if (recurring.length) {
+        const grpRows = recurring.map((g) => ({
+          best_tier: g.best_confidence_tier,
+          members: g.member_count,
+          peaks: (g.peak_counts || []).join(",") || "",
+          gap: g.gap_ms_range
+            ? g.gap_ms_range[0] === g.gap_ms_range[1]
+              ? `${histFmt(g.gap_ms_range[0])}ms`
+              : `${histFmt(g.gap_ms_range[0])}-${histFmt(g.gap_ms_range[1])}ms`
+            : "",
+          queryids: (g.queryids || []).join(", "),
+          template: g.template,
+        }));
+        const grpCols = [
+          {
+            key: "best_tier",
+            label: "best tier",
+            type: "number",
+            sortValue: (r) => HIST_TIER_RANK[r.best_tier] || 0,
+          },
+          { key: "members", label: "members", type: "number", align: "right" },
+          { key: "peaks", label: "peaks" },
+          { key: "gap", label: "gap" },
+          { key: "queryids", label: "queryids" },
+          { key: "template", label: "template" },
+        ];
+        groupHolder.appendChild(
+          buildSortableTable(
+            `Recurring query templates (${recurring.length})`,
+            grpRows,
+            grpCols,
+            "sec-latency-groups"
+          )
+        );
+      }
+    }
+
+    tierSel.addEventListener("change", () => {
+      state.minTier = tierSel.value;
+      rerender();
+    });
+    flagChk.addEventListener("change", () => {
+      state.flaggedOnly = flagChk.checked;
+      rerender();
+    });
+    rerender();
+  }
+
   function renderDoc(doc, prevDoc) {
     const app = document.getElementById("app");
     const nav = document.getElementById("app-nav");
@@ -3195,6 +3838,13 @@
       role: "tabpanel",
       id: "panel-tablets",
       "aria-labelledby": "tab-tablets",
+    });
+    const panelLatency = el("div", {
+      className: "app-panel",
+      "data-viewer-section": "latency",
+      role: "tabpanel",
+      id: "panel-latency",
+      "aria-labelledby": "tab-latency",
     });
 
     if (st) {
@@ -3762,10 +4412,24 @@
       );
     }
 
+    if (docHasLatencyHistograms(doc)) {
+      try {
+        renderLatencyPanel(panelLatency, doc, prevDoc);
+      } catch (e) {
+        panelLatency.appendChild(
+          el("p", {
+            className: "app-panel-empty",
+            textContent: `Latency analysis failed: ${(e && e.message) || e}`,
+          })
+        );
+      }
+    }
+
     app.appendChild(panelPgss);
     app.appendChild(panelYcql);
     app.appendChild(panelAsh);
     app.appendChild(panelTablets);
+    if (docHasLatencyHistograms(doc)) app.appendChild(panelLatency);
     buildViewerNav();
     updateAshFilterToolbar();
   }

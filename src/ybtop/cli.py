@@ -33,12 +33,14 @@ from ybtop.config import (
     DEFAULT_YSQL_USER,
     SNAPSHOT_ASH_PER_NODE,
     SNAPSHOT_ASH_TOP_TABLES,
+    SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE,
     SNAPSHOT_STATEMENTS_PER_NODE,
     Settings,
     load_dsn_from_env_or_none,
     resolve_ash_range,
     resolve_seed_dsn,
 )
+from ybtop.histogram import MIN_TIER_CHOICES
 from ybtop.log import checkpoint_context, get_logger, init_logging, log_event, resolve_log_path
 from ybtop.pg_stat_display import live_top5_statements_table
 from ybtop.render import crz_ash_summary_rows, live_top5_nodes_by_active_session_sec, table_from_rows
@@ -113,6 +115,8 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                         ensure_ycql_extension=(iteration == 1),
                         ash_top_tables=settings.snapshot_ash_top_tables,
                     collect_table_ddl=settings.snapshot_collect_table_ddl,
+                    latency_histograms=settings.snapshot_latency_histograms,
+                    latency_histograms_per_node=settings.snapshot_latency_histograms_per_node,
                     node_parallelism=settings.node_parallelism,
                 )
                     write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
@@ -348,6 +352,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     w.add_argument(
+        "--snapshot-latency-histograms",
+        action="store_true",
+        help=(
+            "Collect per-statement yb_latency_histogram values into each snapshot (opt-in; "
+            "enables the 'ybtop histogram' analysis and the viewer's Latency modes tab). "
+            "No-op on clusters without the yb_latency_histogram column."
+        ),
+    )
+    w.add_argument(
+        "--snapshot-latency-histograms-per-node",
+        type=int,
+        default=SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE,
+        metavar="N",
+        help=(
+            "Top N statements (by call count) per node whose latency histograms are stored "
+            "when --snapshot-latency-histograms is set."
+        ),
+    )
+    w.add_argument(
         "--compress-snapshots",
         action="store_true",
         help="Write snapshot files as gzip-compressed JSON (.json.gz) instead of plain JSON.",
@@ -444,6 +467,93 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVE_PORT,
         help="Listen port for HTTP.",
     )
+
+    hist_p = sub.add_parser(
+        "histogram",
+        help=(
+            "Offline latency-histogram multimodality analysis over snapshot files "
+            "(no database). Requires snapshots captured with watch "
+            "--snapshot-latency-histograms."
+        ),
+        formatter_class=fmt,
+        epilog=(
+            "Confidence tiers (strongest first): very_high (dip p<=0.001), high (p<=0.01), "
+            "moderate (p<=0.05), unconfirmed (shape-flagged, dip test unavailable). "
+            "Install the optional detector with: pip install 'ybtop[histogram]'."
+        ),
+    )
+    hist_p.add_argument(
+        "--data-dir",
+        default=DEFAULT_SNAPSHOT_OUTPUT_DIR,
+        help="Directory containing ybtop.manifest.json and ybtop.out.*.json.",
+    )
+    hist_p.add_argument(
+        "--mode",
+        choices=["auto", "cumulative", "delta"],
+        default="auto",
+        help=(
+            "cumulative: analyze the snapshot's totals. delta: subtract the prior snapshot's "
+            "bucket counts. auto: delta when a prior snapshot has histogram data, else cumulative."
+        ),
+    )
+    sel = hist_p.add_mutually_exclusive_group()
+    sel.add_argument(
+        "--index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="1-based snapshot position in the manifest (negative counts from the end). Default: latest.",
+    )
+    sel.add_argument(
+        "--snapshot",
+        default=None,
+        metavar="TS",
+        help="Select the snapshot whose filename contains this substring (e.g. 20260811_150000).",
+    )
+    hist_p.add_argument(
+        "--min-calls",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Ignore statements with fewer than N calls in the analyzed window.",
+    )
+    hist_p.add_argument(
+        "--min-tier",
+        choices=list(MIN_TIER_CHOICES),
+        default="high",
+        help="Only show rows at or above this confidence tier (use 'all' to show every row).",
+    )
+    hist_p.add_argument(
+        "--fdr-correct",
+        dest="fdr_correct",
+        action="store_true",
+        default=True,
+        help="Apply Benjamini-Hochberg FDR correction across dip p-values (on by default).",
+    )
+    hist_p.add_argument(
+        "--no-fdr-correct",
+        dest="fdr_correct",
+        action="store_false",
+        help="Disable FDR correction.",
+    )
+    hist_p.add_argument(
+        "--fdr-q",
+        type=float,
+        default=0.05,
+        metavar="Q",
+        help="Target false discovery rate for the BH correction.",
+    )
+    hist_p.add_argument(
+        "--flagged-only",
+        action="store_true",
+        help="Only show statements flagged as multimodal.",
+    )
+    hist_p.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Emit JSON ({results, template_groups, mode, snapshots, fdr, ...}).",
+    )
     return p
 
 
@@ -489,6 +599,14 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
             getattr(args, "snapshot_ash_top_tables", SNAPSHOT_ASH_TOP_TABLES)
         ),
         snapshot_collect_table_ddl=bool(getattr(args, "snapshot_table_ddl", False)),
+        snapshot_latency_histograms=bool(getattr(args, "snapshot_latency_histograms", False)),
+        snapshot_latency_histograms_per_node=int(
+            getattr(
+                args,
+                "snapshot_latency_histograms_per_node",
+                SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE,
+            )
+        ),
         snapshot_compress=bool(getattr(args, "compress_snapshots", False)),
         log_enabled=not bool(getattr(args, "no_log_file", False)),
         log_file=getattr(args, "log_file", None),
@@ -505,6 +623,23 @@ def main(argv: Optional[list[str]] = None) -> None:
         from ybtop.serve import run_serve
 
         run_serve(data_dir=args.data_dir, host=args.bind, port=args.port)
+        return
+
+    if args.command == "histogram":
+        from ybtop.histogram_report import run_histogram
+
+        run_histogram(
+            data_dir=args.data_dir,
+            mode=args.mode,
+            index=args.index,
+            snapshot=args.snapshot,
+            min_calls=args.min_calls,
+            min_tier=args.min_tier,
+            fdr_correct=args.fdr_correct,
+            fdr_q=args.fdr_q,
+            flagged_only=args.flagged_only,
+            as_json=args.as_json,
+        )
         return
 
     settings = _settings_from_args(args)

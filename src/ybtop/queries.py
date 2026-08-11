@@ -120,6 +120,33 @@ def pg_stat_statements_top(conn: psycopg.Connection, limit: int, caps: Capabilit
     return fetch_all(conn, sql, {"limit": limit})
 
 
+def pg_stat_latency_histograms_top(
+    conn: psycopg.Connection, limit: int, caps: Capabilities
+) -> list[dict[str, Any]]:
+    """Top-N statements by call count carrying the YugabyteDB yb_latency_histogram column.
+
+    Ordered by ``calls`` (not time) because multimodality analysis cares about queries
+    with enough calls to populate distinct latency buckets. Returns an empty list when the
+    cluster does not expose ``yb_latency_histogram``.
+    """
+    if not caps.pg_stat_latency_histogram:
+        return []
+    sql = """
+    SELECT
+        s.queryid::text AS queryid,
+        s.query::text AS query,
+        s.calls::bigint AS calls,
+        s.yb_latency_histogram AS yb_latency_histogram,
+        NULLIF(BTRIM(db.datname::text), '') AS dbname
+    FROM pg_stat_statements s
+    LEFT JOIN pg_database db ON db.oid = s.dbid
+    WHERE s.yb_latency_histogram IS NOT NULL
+    ORDER BY s.calls DESC
+    LIMIT %(limit)s;
+    """
+    return fetch_all(conn, sql, {"limit": limit})
+
+
 def ash_aggregated(
     conn: psycopg.Connection,
     ash_start: datetime,

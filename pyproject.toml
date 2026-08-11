@@ -1,6 +1,6 @@
 [project]
 name = "ybtop"
-version = "0.1.11"
+version = "0.1.12"
 description = "Terminal observability for YugabyteDB (pg_stat_statements, ASH, tablet views)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -23,6 +23,16 @@ classifiers = [
 dependencies = [
   "psycopg[binary]>=3.2",
   "rich>=13.7",
+]
+
+[project.optional-dependencies]
+# Latency-histogram multimodality detection ("ybtop histogram" / viewer Latency modes tab).
+# diptest adds the confirmatory Hartigan dip test; without it, shape-flagged rows are
+# reported as "unconfirmed" (same behavior as the browser viewer).
+histogram = [
+  "numpy>=1.21",
+  "scipy>=1.7",
+  "diptest>=0.5",
 ]
 
 [project.scripts]

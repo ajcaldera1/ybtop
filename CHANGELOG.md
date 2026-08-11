@@ -2,6 +2,14 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [0.1.12] — 2026-08-11
+
+### Added
+
+- **Latency-histogram collection (opt-in):** **`ybtop watch --snapshot-latency-histograms`** stores each statement's YugabyteDB **`yb_latency_histogram`** (top **N** by call count, **`--snapshot-latency-histograms-per-node`**, default `100`) as a new **`latency_histograms.per_node`** section in the snapshot JSON. Collected as a **separate** top-N section (independent of `--snapshot-statements-per-node`), capability-gated on the `yb_latency_histogram` column, and normalized to a flat `{bucket_label: count}` map. No database tables are created — cumulative counters live in the snapshot files, and deltas are computed by subtracting consecutive snapshots.
+- **`ybtop histogram` command (offline, no database):** Detects statements whose per-call latency distribution is **bimodal/multimodal** (two or more distinct speed classes) over the file-based snapshots. Tiered detector (bimodality coefficient → density/peak finding → valley check → Hartigan dip test) with **confidence tiers** (`very_high` / `high` / `moderate` / `unconfirmed`), **Benjamini-Hochberg FDR** correction (on by default), and **query-template grouping** (IN-list- and per-call-comment-aware). Flags: **`--mode`** (`auto` / `cumulative` / `delta`), **`--index`** / **`--snapshot`**, **`--min-calls`**, **`--min-tier`**, **`--no-fdr-correct`**, **`--fdr-q`**, **`--flagged-only`**, **`--json`**. Requires the optional extra `pip install 'ybtop[histogram]'` (numpy, scipy, and diptest for the confirmatory test).
+- **Browser (Latency modes tab):** When a snapshot carries `latency_histograms`, the viewer shows a **Latency modes** tab with the same cumulative/delta convention as the statement tabs (delta vs prior snapshot when available). Runs Stages 0-2 plus template grouping in the browser with min-tier / flagged-only filters. The Hartigan dip test is not available in the browser, so shape-flagged rows are reported as **`unconfirmed`**; run `ybtop histogram` for dip-test confirmation and FDR-corrected tiers.
+
 ## [0.1.11] — 2026-06-03
 
 ### Added

@@ -41,6 +41,56 @@ def _serialize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return json.loads(json.dumps(rows, default=_json_default))
 
 
+def normalize_latency_histogram(raw: Any) -> dict[str, int]:
+    """Canonicalize a ``yb_latency_histogram`` value to a flat ``{bucket_label: count}`` map.
+
+    YugabyteDB returns the column as a JSON array of single-key objects
+    (``[{"[0.0,1.0)": 6}, {"[1.0,2.0)": 2}]``); older/mocked shapes may already be a flat
+    object or a JSON string. Storing one canonical flat map keeps cross-node merge and
+    inter-snapshot delta trivial (sum / subtract by label) and detection encoding-agnostic.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    items: list[tuple[Any, Any]] = []
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    elif isinstance(raw, list):
+        for el in raw:
+            if isinstance(el, dict):
+                items.extend(el.items())
+    else:
+        return {}
+    out: dict[str, int] = {}
+    for k, v in items:
+        try:
+            cnt = int(v)
+        except (TypeError, ValueError):
+            continue
+        label = str(k)
+        out[label] = out.get(label, 0) + cnt
+    return out
+
+
+def _normalize_latency_histogram_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "queryid": r.get("queryid"),
+                "query": r.get("query"),
+                "dbname": r.get("dbname"),
+                "calls": int(r.get("calls") or 0),
+                "yb_latency_histogram": normalize_latency_histogram(r.get("yb_latency_histogram")),
+            }
+        )
+    return out
+
+
 def _atomic_write_json(path: Path, payload: Any, *, compress: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(payload, indent=2, default=_json_default).encode("utf-8")
@@ -74,6 +124,8 @@ def build_snapshot_document(
     ensure_ycql_extension: bool = False,
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
+    latency_histograms: bool = False,
+    latency_histograms_per_node: int = 100,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     with stage_timer("build_snapshot", _log, scope_total=True):
@@ -87,6 +139,8 @@ def build_snapshot_document(
                 ensure_ycql_extension=ensure_ycql_extension,
                 ash_top_tables=ash_top_tables,
                 collect_table_ddl=collect_table_ddl,
+                latency_histograms=latency_histograms,
+                latency_histograms_per_node=latency_histograms_per_node,
                 node_parallelism=node_parallelism,
             )
 
@@ -98,6 +152,7 @@ class _NodeCollectResult:
     ycql: list[dict[str, Any]]
     ash: list[dict[str, Any]]
     tablets: list[dict[str, Any]]
+    latency_histograms: list[dict[str, Any]]
 
 
 def _collect_one_node(
@@ -111,9 +166,12 @@ def _collect_one_node(
     ash_window_sec: float,
     statements_per_node: int,
     ash_per_node: int,
+    collect_latency_histograms: bool,
+    latency_histograms_per_node: int,
 ) -> _NodeCollectResult:
     nid = node_id(node)
     dsn = dsn_for_node(seed_dsn, node)
+    latency_histograms: list[dict[str, Any]] = []
     with stage_timer("collect_node", _log, node_id=nid, node_total=True, node_count=node_count):
         with connect(dsn) as conn:
             with stage_timer("pg_stat_statements_top", _log, node_id=nid) as st:
@@ -135,7 +193,24 @@ def _collect_one_node(
             with stage_timer("yb_local_tablets_rows", _log, node_id=nid) as st:
                 tablets = _serialize_rows(Q.yb_local_tablets_rows(conn))
                 st.row_count = len(tablets)
-    return _NodeCollectResult(nid=nid, pg_stat=pg_stat, ycql=ycql, ash=ash, tablets=tablets)
+            if collect_latency_histograms and caps.pg_stat_latency_histogram:
+                with stage_timer("pg_stat_latency_histograms_top", _log, node_id=nid) as st:
+                    latency_histograms = _normalize_latency_histogram_rows(
+                        _serialize_rows(
+                            Q.pg_stat_latency_histograms_top(
+                                conn, latency_histograms_per_node, caps
+                            )
+                        )
+                    )
+                    st.row_count = len(latency_histograms)
+    return _NodeCollectResult(
+        nid=nid,
+        pg_stat=pg_stat,
+        ycql=ycql,
+        ash=ash,
+        tablets=tablets,
+        latency_histograms=latency_histograms,
+    )
 
 
 def _collect_nodes_parallel(
@@ -148,8 +223,11 @@ def _collect_nodes_parallel(
     ash_window_sec: float,
     statements_per_node: int,
     ash_per_node: int,
+    collect_latency_histograms: bool,
+    latency_histograms_per_node: int,
     node_parallelism: int,
 ) -> tuple[
+    dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
@@ -159,6 +237,7 @@ def _collect_nodes_parallel(
     ycql_out: dict[str, list[dict[str, Any]]] = {}
     ash_out: dict[str, list[dict[str, Any]]] = {}
     tablets_out: dict[str, list[dict[str, Any]]] = {}
+    histograms_out: dict[str, list[dict[str, Any]]] = {}
     workers = min(max(1, int(node_parallelism)), len(nodes))
     node_count = len(nodes)
     collect_kw = {
@@ -170,6 +249,8 @@ def _collect_nodes_parallel(
         "ash_window_sec": ash_window_sec,
         "statements_per_node": statements_per_node,
         "ash_per_node": ash_per_node,
+        "collect_latency_histograms": collect_latency_histograms,
+        "latency_histograms_per_node": latency_histograms_per_node,
     }
 
     def _run(node: YsqlNode) -> _NodeCollectResult:
@@ -200,7 +281,9 @@ def _collect_nodes_parallel(
         ycql_out[r.nid] = r.ycql
         ash_out[r.nid] = r.ash
         tablets_out[r.nid] = r.tablets
-    return statements_out, ycql_out, ash_out, tablets_out
+        if collect_latency_histograms:
+            histograms_out[r.nid] = r.latency_histograms
+    return statements_out, ycql_out, ash_out, tablets_out, histograms_out
 
 
 def _build_snapshot_document_impl(
@@ -213,6 +296,8 @@ def _build_snapshot_document_impl(
     ensure_ycql_extension: bool = False,
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
+    latency_histograms: bool = False,
+    latency_histograms_per_node: int = 100,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     ash_window_sec = round((ash_end - ash_start).total_seconds(), 2)
@@ -241,18 +326,24 @@ def _build_snapshot_document_impl(
             with connect(seed_dsn) as conn:
                 Q.ensure_yb_ycql_utils_extension(conn)
 
-    statements_per_node_out, ycql_per_node_out, ash_per_node_out, tablets_per_node_out = (
-        _collect_nodes_parallel(
-            seed_dsn=seed_dsn,
-            nodes=nodes,
-            caps=caps,
-            ash_start=ash_start,
-            ash_end=ash_end,
-            ash_window_sec=ash_window_sec,
-            statements_per_node=statements_per_node,
-            ash_per_node=ash_per_node,
-            node_parallelism=node_parallelism,
-        )
+    (
+        statements_per_node_out,
+        ycql_per_node_out,
+        ash_per_node_out,
+        tablets_per_node_out,
+        latency_histograms_per_node_out,
+    ) = _collect_nodes_parallel(
+        seed_dsn=seed_dsn,
+        nodes=nodes,
+        caps=caps,
+        ash_start=ash_start,
+        ash_end=ash_end,
+        ash_window_sec=ash_window_sec,
+        statements_per_node=statements_per_node,
+        ash_per_node=ash_per_node,
+        collect_latency_histograms=latency_histograms,
+        latency_histograms_per_node=latency_histograms_per_node,
+        node_parallelism=node_parallelism,
     )
 
     top_tables: list[dict[str, Any]] = []
@@ -305,6 +396,12 @@ def _build_snapshot_document_impl(
         }
     if table_schemas:
         doc["table_schemas"] = {"by_table_id": table_schemas}
+    if latency_histograms:
+        doc["latency_histograms"] = {
+            "limit": latency_histograms_per_node,
+            "supported": bool(caps.pg_stat_latency_histogram),
+            "per_node": latency_histograms_per_node_out,
+        }
     return doc
 
 

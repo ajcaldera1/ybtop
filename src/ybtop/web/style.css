@@ -782,6 +782,36 @@ tr:nth-child(even) {
   font-weight: 700;
 }
 
+.latency-banner-title {
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+.latency-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  margin: 0 0 0.85rem;
+  font-size: 0.85rem;
+}
+
+.latency-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--yb-text);
+}
+
+.latency-control select {
+  background: var(--yb-panel, #12181f);
+  color: var(--yb-text);
+  border: 1px solid var(--yb-border);
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  font: inherit;
+}
+
 .pgss-activity-mono {
   font-variant-numeric: tabular-nums;
 }
