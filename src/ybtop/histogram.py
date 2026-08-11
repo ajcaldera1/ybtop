@@ -279,7 +279,7 @@ _WS_RE = re.compile(r"\s+")
 def normalize_query_template(query: Optional[str]) -> str:
     """Collapse a query into a template that ignores per-call comments and IN-list arity.
 
-    1. Strip embedded per-call comments (e.g. Senzing ``/*rewritten_pid='123'*/``).
+    1. Strip embedded per-call comments (e.g. ``/*rewritten_pid='123'*/``).
     2. Collapse any ``IN (...)`` list (literals or ``$N``) to a canonical ``IN (...)``.
     3. Collapse remaining ``$N`` placeholders (positions shift after step 2) to ``$N``.
     4. Collapse whitespace.
