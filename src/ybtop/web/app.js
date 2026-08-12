@@ -3721,6 +3721,42 @@
     controls.appendChild(flagWrap);
     panel.appendChild(controls);
 
+    const legend = el("div", { className: "latency-legend" });
+    legend.appendChild(
+      el("div", {
+        className: "latency-legend-title",
+        textContent: "Reading spread vs. gap",
+      })
+    );
+    [
+      [
+        "peaks",
+        "How many latency modes (speed classes) survived smoothing. 2+ is what makes a " +
+          "statement multimodal.",
+      ],
+      [
+        "spread",
+        "Overall range, shown as lowest\u2013highest bucket with calls and (\u00d7 max\u00f7min). " +
+          "It measures total variability, not multimodality: a query can have a wide spread and " +
+          "still be a single mode (e.g. one broad hump), so a big spread alone is not a red flag.",
+      ],
+      [
+        "gap",
+        "The split itself, shown as fast peak \u2192 slow peak with (\u00d7 slow\u00f7fast) \u2014 the " +
+          "two dominant modes from peaks. Example: 5\u219280ms (\u00d716) means the slow " +
+          "\u201cpersonality\u201d runs ~16\u00d7 slower than the fast one. This is the number that says " +
+          "\u201cfast calls vs. slow calls,\u201d and the ratio hints at the cause (a ~2\u00d7 gap looks " +
+          "like cache hit/miss; a 10\u2013100\u00d7 gap looks more like retries, leader/follower reads, " +
+          "or cross-AZ hops).",
+      ],
+    ].forEach(([k, v]) => {
+      const row = el("div", { className: "latency-legend-row" });
+      row.appendChild(el("code", { className: "latency-legend-key", textContent: k }));
+      row.appendChild(el("span", { className: "latency-legend-val", textContent: v }));
+      legend.appendChild(row);
+    });
+    panel.appendChild(legend);
+
     const groupHolder = el("div");
     const tableHolder = el("div");
     panel.appendChild(groupHolder);
