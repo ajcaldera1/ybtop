@@ -787,6 +787,19 @@ tr:nth-child(even) {
   margin-bottom: 0.35rem;
 }
 
+.latency-confirmed-badge {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+  color: var(--yb-bg, #0b0f14);
+  background: var(--yb-accent, #35c46a);
+}
+
 .latency-controls {
   display: flex;
   flex-wrap: wrap;

@@ -73,6 +73,52 @@ def _watch_header_line(*, viewer_url: Optional[str], out_dir: Path) -> Text:
     return Text(f"ybtop watch: (data dir: {root})")
 
 
+_latency_analysis_deps_warned = False
+
+
+def _maybe_write_latency_analysis(
+    *, out_dir: Path, snapshot_file: str, doc: Any, settings: Settings, log: Any
+) -> None:
+    """Best-effort: precompute the dip-confirmed latency report sidecar for the fresh snapshot.
+
+    Never raises into the watch loop. Missing optional deps ([histogram] extra) are logged once;
+    a cluster without ``yb_latency_histogram`` data is silently skipped.
+    """
+    global _latency_analysis_deps_warned
+    from ybtop.histogram import has_latency_histogram_data
+
+    if not (isinstance(doc, dict) and has_latency_histogram_data(doc)):
+        return
+    try:
+        from ybtop.histogram_detect import HistogramDepsError
+        from ybtop.histogram_report import build_analysis_artifact
+        from ybtop.snapshot_write import write_latency_analysis_and_update_manifest
+
+        artifact = build_analysis_artifact(
+            str(out_dir),
+            index=None,  # latest = the snapshot just written
+            min_calls=30,
+            fdr_q=0.05,
+        )
+        write_latency_analysis_and_update_manifest(
+            output_dir=out_dir,
+            snapshot_file=snapshot_file,
+            artifact=artifact,
+            compress=settings.snapshot_compress,
+        )
+    except HistogramDepsError as exc:
+        if not _latency_analysis_deps_warned:
+            _latency_analysis_deps_warned = True
+            log_event(
+                log,
+                "latency_analysis_skipped",
+                level=logging.WARNING,
+                reason=str(exc),
+            )
+    except Exception as exc:  # noqa: BLE001 - analysis must never break the snapshot loop
+        log_event(log, "latency_analysis_error", level=logging.WARNING, error=str(exc))
+
+
 def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
     console = Console()
     out_dir = Path(settings.snapshot_output_dir)
@@ -119,7 +165,15 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                     latency_histograms_per_node=settings.snapshot_latency_histograms_per_node,
                     node_parallelism=settings.node_parallelism,
                 )
-                    write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
+                    snap_path = write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
+                    if settings.snapshot_latency_analysis:
+                        _maybe_write_latency_analysis(
+                            out_dir=out_dir,
+                            snapshot_file=snap_path.name,
+                            doc=doc,
+                            settings=settings,
+                            log=watch_log,
+                        )
                     gc_snapshots_and_manifest(
                         output_dir=out_dir,
                         retention_hours=settings.snapshot_retention_hours,
@@ -371,6 +425,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     w.add_argument(
+        "--snapshot-latency-analysis",
+        action="store_true",
+        help=(
+            "Precompute the dip-confirmed latency-multimodality report (cumulative + delta) into "
+            "an ybtop.latency.*.json sidecar per snapshot, so the browser shows confirmed tiers "
+            "offline without shipping any statistics code. Implies --snapshot-latency-histograms; "
+            "best-effort (skipped with a log note if the [histogram] extra is not installed)."
+        ),
+    )
+    w.add_argument(
         "--compress-snapshots",
         action="store_true",
         help="Write snapshot files as gzip-compressed JSON (.json.gz) instead of plain JSON.",
@@ -554,6 +618,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit JSON ({results, template_groups, mode, snapshots, fdr, ...}).",
     )
+    hist_p.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Instead of printing, write an ybtop.latency.*.json analysis sidecar next to the "
+            "selected snapshot (cumulative + delta, unfiltered) and record it in the manifest, "
+            "so the browser viewer shows dip-confirmed tiers offline. Use --all for every "
+            "snapshot in the directory."
+        ),
+    )
+    hist_p.add_argument(
+        "--all",
+        dest="write_all",
+        action="store_true",
+        help="With --write, produce analysis sidecars for every snapshot in the manifest.",
+    )
     return p
 
 
@@ -599,7 +679,10 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
             getattr(args, "snapshot_ash_top_tables", SNAPSHOT_ASH_TOP_TABLES)
         ),
         snapshot_collect_table_ddl=bool(getattr(args, "snapshot_table_ddl", False)),
-        snapshot_latency_histograms=bool(getattr(args, "snapshot_latency_histograms", False)),
+        # --snapshot-latency-analysis needs the histograms in the snapshot, so it implies collection.
+        snapshot_latency_histograms=bool(getattr(args, "snapshot_latency_histograms", False))
+        or bool(getattr(args, "snapshot_latency_analysis", False)),
+        snapshot_latency_analysis=bool(getattr(args, "snapshot_latency_analysis", False)),
         snapshot_latency_histograms_per_node=int(
             getattr(
                 args,
@@ -626,6 +709,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         return
 
     if args.command == "histogram":
+        if getattr(args, "write", False):
+            from ybtop.histogram_report import run_histogram_write
+
+            run_histogram_write(
+                data_dir=args.data_dir,
+                index=args.index,
+                snapshot=args.snapshot,
+                write_all=bool(getattr(args, "write_all", False)),
+                min_calls=args.min_calls,
+                fdr_q=args.fdr_q,
+            )
+            return
+
         from ybtop.histogram_report import run_histogram
 
         run_histogram(

@@ -6,9 +6,11 @@ No database access - operates purely on the file-based snapshots written by ``yb
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ybtop import __version__
 from ybtop.histogram import (
     CONFIDENCE_TIER_RANK,
     apply_bh_correction,
@@ -318,3 +320,118 @@ def run_histogram(
         print(json.dumps(report, indent=2, default=str))
     else:
         print(format_report_text(report))
+
+
+# --------------------------------------------------------------------------------------
+# Precomputed analysis artifacts (sidecar files for offline / browser viewing)
+# --------------------------------------------------------------------------------------
+ANALYSIS_ARTIFACT_SCHEMA = 1
+
+
+def build_analysis_artifact(
+    data_dir: str,
+    *,
+    index: Optional[int] = None,
+    snapshot: Optional[str] = None,
+    min_calls: int = 30,
+    fdr_q: float = 0.05,
+) -> dict[str, Any]:
+    """Precompute the full (dip-confirmed) latency report for one snapshot, for offline viewing.
+
+    Returns a JSON-serializable artifact carrying both the ``cumulative`` report (this
+    snapshot's totals) and the ``delta`` report (vs the immediately prior snapshot, or ``None``
+    when there is no prior snapshot with histogram data). Both are emitted unfiltered
+    (``min_tier=all``) so the browser keeps its interactive tier / flagged filters. Requires the
+    ``[histogram]`` extra (raises :class:`~ybtop.histogram_detect.HistogramDepsError` otherwise).
+    """
+    cumulative = analyze(
+        data_dir,
+        mode="cumulative",
+        index=index,
+        snapshot=snapshot,
+        min_calls=min_calls,
+        min_tier="all",
+        fdr_correct=True,
+        fdr_q=fdr_q,
+        flagged_only=False,
+    )
+    delta_report = analyze(
+        data_dir,
+        mode="delta",
+        index=index,
+        snapshot=snapshot,
+        min_calls=min_calls,
+        min_tier="all",
+        fdr_correct=True,
+        fdr_q=fdr_q,
+        flagged_only=False,
+    )
+    # analyze() falls back to cumulative when no prior histogram data exists; only keep a genuine
+    # delta so the viewer can tell "no prior" apart from a real Δ.
+    delta = delta_report if delta_report.get("mode") == "delta" else None
+    return {
+        "schema": ANALYSIS_ARTIFACT_SCHEMA,
+        "ybtop_version": __version__,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "diptest_available": diptest_available(),
+        "params": {"min_calls": min_calls, "fdr_q": fdr_q},
+        "cumulative": cumulative,
+        "delta": delta,
+    }
+
+
+def run_histogram_write(
+    *,
+    data_dir: str,
+    index: Optional[int],
+    snapshot: Optional[str],
+    write_all: bool,
+    min_calls: int,
+    fdr_q: float,
+    compress: bool = False,
+) -> None:
+    """`ybtop histogram --write`: precompute and persist analysis sidecars for later viewing."""
+    from ybtop.snapshot_write import write_latency_analysis_and_update_manifest
+
+    out_dir = Path(data_dir)
+    entries = read_manifest_entries(out_dir)
+    if not entries:
+        raise SystemExit(
+            f"ybtop histogram: no {out_dir.resolve()}/ybtop.manifest.json entries found."
+        )
+
+    if write_all:
+        targets = list(range(1, len(entries) + 1))
+    else:
+        try:
+            targets = [_resolve_index(entries, index=index, snapshot=snapshot) + 1]
+        except HistogramAnalysisError as exc:
+            raise SystemExit(f"ybtop histogram: {exc}")
+
+    written = 0
+    skipped = 0
+    for one in targets:
+        entry = entries[one - 1]
+        cur_doc = load_snapshot_json(out_dir, str(entry.get("file")))
+        if cur_doc is None or not has_latency_histogram_data(cur_doc):
+            skipped += 1
+            continue
+        try:
+            artifact = build_analysis_artifact(
+                data_dir, index=one, min_calls=min_calls, fdr_q=fdr_q
+            )
+        except HistogramDepsError as exc:
+            raise SystemExit(str(exc))
+        path = write_latency_analysis_and_update_manifest(
+            output_dir=out_dir,
+            snapshot_file=str(entry.get("file")),
+            artifact=artifact,
+            compress=compress,
+        )
+        written += 1
+        print(f"wrote {path.name}  (snapshot {one}/{len(entries)}: {entry.get('file')})")
+
+    print(
+        f"ybtop histogram --write: {written} analysis file(s) written, "
+        f"{skipped} snapshot(s) skipped (no latency_histograms)."
+    )

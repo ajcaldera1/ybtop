@@ -23,6 +23,9 @@ SNAPSHOT_ASH_TOP_TABLES = 25
 SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE = 100
 MANIFEST_FILENAME = "ybtop.manifest.json"
 SNAPSHOT_FILE_PREFIX = "ybtop.out."
+# Sidecar written next to each snapshot when watch --snapshot-latency-analysis is set:
+# the precomputed (dip-confirmed) latency-multimodality report for offline viewing.
+LATENCY_ANALYSIS_FILE_PREFIX = "ybtop.latency."
 
 DEFAULT_SERVE_HOST = "127.0.0.1"
 DEFAULT_SERVE_PORT = 8765
@@ -50,6 +53,7 @@ class Settings:
     snapshot_collect_table_ddl: bool = False
     snapshot_latency_histograms: bool = False
     snapshot_latency_histograms_per_node: int = SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE
+    snapshot_latency_analysis: bool = False
     snapshot_compress: bool = False
     log_enabled: bool = True
     log_file: Optional[str] = None

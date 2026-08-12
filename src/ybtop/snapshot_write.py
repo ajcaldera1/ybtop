@@ -18,7 +18,12 @@ import psycopg.conninfo
 
 from ybtop import queries as Q
 from ybtop.capabilities import Capabilities, detect_capabilities
-from ybtop.config import DEFAULT_NODE_PARALLELISM, MANIFEST_FILENAME, SNAPSHOT_FILE_PREFIX
+from ybtop.config import (
+    DEFAULT_NODE_PARALLELISM,
+    LATENCY_ANALYSIS_FILE_PREFIX,
+    MANIFEST_FILENAME,
+    SNAPSHOT_FILE_PREFIX,
+)
 from ybtop.db import connect
 from ybtop.log import get_logger, log_event, stage_timer, summary_scope
 from ybtop.merge import top_ash_table_ids
@@ -525,6 +530,61 @@ def write_snapshot_and_update_manifest(
         return snap_path
 
 
+def latency_analysis_filename(snapshot_filename: str, *, compress: bool = False) -> str:
+    """Sidecar name for a snapshot: ``ybtop.out.<ts>.json`` -> ``ybtop.latency.<ts>.json``."""
+    base = snapshot_filename
+    for ext in (".json.gz", ".json"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    ts = base[len(SNAPSHOT_FILE_PREFIX):] if base.startswith(SNAPSHOT_FILE_PREFIX) else base
+    ext = ".json.gz" if compress else ".json"
+    return f"{LATENCY_ANALYSIS_FILE_PREFIX}{ts}{ext}"
+
+
+def write_latency_analysis_and_update_manifest(
+    *,
+    output_dir: Path,
+    snapshot_file: str,
+    artifact: dict[str, Any],
+    compress: bool = False,
+) -> Path:
+    """Write a precomputed latency-analysis sidecar and record it on the snapshot's manifest entry.
+
+    The manifest entry for ``snapshot_file`` gains a ``latency_analysis`` field pointing at the
+    sidecar so the viewer can load it without probing, and GC prunes the two together.
+    """
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_name = latency_analysis_filename(snapshot_file, compress=compress)
+    sidecar_path = output_dir / sidecar_name
+    _atomic_write_json(sidecar_path, artifact, compress=compress)
+
+    manifest_path = output_dir / MANIFEST_FILENAME
+    entries: list[dict[str, Any]] = []
+    if manifest_path.is_file():
+        try:
+            prev = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(prev, list):
+                entries = prev
+            elif isinstance(prev, dict) and isinstance(prev.get("entries"), list):
+                entries = list(prev["entries"])
+        except (json.JSONDecodeError, OSError):
+            entries = []
+    for e in entries:
+        if e.get("file") == snapshot_file:
+            e["latency_analysis"] = sidecar_name
+    _atomic_write_json(manifest_path, {"format_version": 1, "entries": entries})
+    log_event(
+        _log,
+        "latency_analysis_written",
+        snapshot_file=snapshot_file,
+        analysis_file=sidecar_name,
+        analysis_bytes=sidecar_path.stat().st_size,
+    )
+    return sidecar_path
+
+
 def gc_snapshots_and_manifest(
     *,
     output_dir: Path,
@@ -550,6 +610,8 @@ def gc_snapshots_and_manifest(
         for path in (
             glob.glob(str(output_dir / f"{SNAPSHOT_FILE_PREFIX}*.json"))
             + glob.glob(str(output_dir / f"{SNAPSHOT_FILE_PREFIX}*.json.gz"))
+            + glob.glob(str(output_dir / f"{LATENCY_ANALYSIS_FILE_PREFIX}*.json"))
+            + glob.glob(str(output_dir / f"{LATENCY_ANALYSIS_FILE_PREFIX}*.json.gz"))
         ):
             p = Path(path)
             mt = file_mtime_utc(p)

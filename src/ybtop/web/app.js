@@ -3595,6 +3595,21 @@
   }
 
   function analyzeLatencyDoc(doc, prevDoc) {
+    // Prefer a precomputed (dip-confirmed) sidecar when watch/histogram --write produced one:
+    // it already carries real dip_p / FDR-corrected tiers, so the browser needs no statistics.
+    const pre = doc && doc._latencyAnalysis;
+    if (pre && (pre.cumulative || pre.delta)) {
+      const prevHas = docHasLatencyHistograms(prevDoc);
+      const useDelta = prevHas && pre.delta && Array.isArray(pre.delta.results);
+      const block = useDelta ? pre.delta : pre.cumulative;
+      const results = block && Array.isArray(block.results) ? block.results.slice() : [];
+      return {
+        mode: useDelta ? "delta" : "cumulative",
+        results: results,
+        source: "offline",
+        diptest: !!pre.diptest_available,
+      };
+    }
     const cur = mergeLatencyHistograms(doc.latency_histograms.per_node);
     const prevHas = docHasLatencyHistograms(prevDoc);
     const mode = prevHas ? "delta" : "cumulative";
@@ -3615,7 +3630,7 @@
     });
     // Ranking and template grouping are deferred to the panel so they run over the
     // currently-displayed (filtered) rows, matching the Python report ordering.
-    return { mode, results };
+    return { mode, results, source: "browser" };
   }
 
   function histFmt(v, digits) {
@@ -3642,23 +3657,41 @@
     const analysis = analyzeLatencyDoc(doc, prevDoc);
     const state = { minTier: "high", flaggedOnly: false };
 
+    const offline = analysis.source === "offline";
     const banner = el("div", { className: "pgss-activity-banner latency-banner" });
     const modeLabel = analysis.mode === "delta" ? "Δ vs prior snapshot" : "cumulative totals";
-    banner.appendChild(
-      el("div", {
-        className: "latency-banner-title",
-        textContent: `Latency multimodality — ${modeLabel}`,
-      })
-    );
+    const titleText = offline
+      ? `Latency multimodality — ${modeLabel} · dip-confirmed`
+      : `Latency multimodality — ${modeLabel}`;
+    const titleEl = el("div", {
+      className: "latency-banner-title",
+      textContent: titleText,
+    });
+    if (offline) {
+      titleEl.appendChild(
+        el("span", {
+          className: "latency-confirmed-badge",
+          textContent: analysis.diptest ? "dip-confirmed" : "precomputed",
+        })
+      );
+    }
+    banner.appendChild(titleEl);
     banner.appendChild(
       el("div", {
         className: "pgss-activity-note",
-        textContent:
-          "Browser detection runs Stages 0-2 (bimodality coefficient, peak finding, valley " +
-          "check) + query-template grouping. The confirmatory Hartigan dip test is not " +
-          "available in the browser, so shape-flagged queries are reported as 'unconfirmed'. " +
-          "Run 'ybtop histogram' (with the [histogram] extra) for dip-test confirmation and " +
-          "FDR-corrected tiers.",
+        textContent: offline
+          ? "Showing results precomputed by ybtop from this snapshot, including the " +
+            "confirmatory Hartigan dip test and Benjamini-Hochberg FDR correction, so tiers " +
+            "match 'ybtop histogram'. No statistics run in the browser." +
+            (analysis.diptest
+              ? ""
+              : " (This sidecar was written without the diptest package, so shape-flagged " +
+                "rows remain 'unconfirmed'.)")
+          : "Browser detection runs Stages 0-2 (bimodality coefficient, peak finding, valley " +
+            "check) + query-template grouping. The confirmatory Hartigan dip test is not " +
+            "available in the browser, so shape-flagged queries are reported as 'unconfirmed'. " +
+            "Run 'ybtop histogram' (or watch --snapshot-latency-analysis) for dip-test " +
+            "confirmation and FDR-corrected tiers.",
       })
     );
     panel.appendChild(banner);
@@ -3710,7 +3743,7 @@
         rank: r.confidence_rank,
         calls: r.calls,
         bc: r.bc != null ? round4(r.bc) : "",
-        dip_p: "—",
+        dip_p: r.dip_p == null ? "—" : histFmt(r.dip_p, 4),
         peaks: r.n_raw_peaks,
         spread: histSpreadStr(r),
         gap: histGapStr(r),
@@ -4695,10 +4728,14 @@
     const name = ent.file;
     try {
       const prevName = index > 0 ? manifestEntries[index - 1].file : null;
-      const [doc, prevDoc] = await Promise.all([
+      const analysisName = ent && ent.latency_analysis ? ent.latency_analysis : null;
+      const [doc, prevDoc, analysis] = await Promise.all([
         fetchJson(name),
         prevName ? fetchJson(prevName).catch(() => null) : Promise.resolve(null),
+        analysisName ? fetchJson(analysisName).catch(() => null) : Promise.resolve(null),
       ]);
+      // Precomputed (dip-confirmed) latency report, when watch/histogram --write produced one.
+      if (doc && analysis) doc._latencyAnalysis = analysis;
       app.textContent = "";
       renderDoc(doc, prevDoc);
       updateNavDisplay(index, manifestEntries.length, ent, doc);
