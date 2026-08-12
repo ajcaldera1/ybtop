@@ -40,7 +40,6 @@ from ybtop.config import (
     resolve_ash_range,
     resolve_seed_dsn,
 )
-from ybtop.histogram import MIN_TIER_CHOICES
 from ybtop.log import checkpoint_context, get_logger, init_logging, log_event, resolve_log_path
 from ybtop.pg_stat_display import live_top5_statements_table
 from ybtop.render import crz_ash_summary_rows, live_top5_nodes_by_active_session_sec, table_from_rows
@@ -535,15 +534,17 @@ def build_parser() -> argparse.ArgumentParser:
     hist_p = sub.add_parser(
         "histogram",
         help=(
-            "Offline latency-histogram multimodality analysis over snapshot files "
-            "(no database). Requires snapshots captured with watch "
-            "--snapshot-latency-histograms."
+            "Offline latency-histogram multimodality analysis of the latest snapshot's "
+            "cumulative totals (no database). Requires snapshots captured with watch "
+            "--snapshot-latency-histograms. For delta analysis and interactive filtering, use "
+            "the viewer's Latency modes tab."
         ),
         formatter_class=fmt,
         epilog=(
             "Confidence tiers (strongest first): very_high (dip p<=0.001), high (p<=0.01), "
-            "moderate (p<=0.05), unconfirmed (shape-flagged, dip test unavailable). "
-            "Install the optional detector with: pip install 'ybtop[histogram]'."
+            "moderate (p<=0.05), unconfirmed (shape-flagged, dip test unavailable). Rows below "
+            "the 'high' tier are hidden. Install the optional detector with: "
+            "pip install 'ybtop[histogram]'."
         ),
     )
     hist_p.add_argument(
@@ -552,87 +553,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory containing ybtop.manifest.json and ybtop.out.*.json.",
     )
     hist_p.add_argument(
-        "--mode",
-        choices=["auto", "cumulative", "delta"],
-        default="auto",
-        help=(
-            "cumulative: analyze the snapshot's totals. delta: subtract the prior snapshot's "
-            "bucket counts. auto: delta when a prior snapshot has histogram data, else cumulative."
-        ),
-    )
-    sel = hist_p.add_mutually_exclusive_group()
-    sel.add_argument(
-        "--index",
-        type=int,
-        default=None,
-        metavar="N",
-        help="1-based snapshot position in the manifest (negative counts from the end). Default: latest.",
-    )
-    sel.add_argument(
-        "--snapshot",
-        default=None,
-        metavar="TS",
-        help="Select the snapshot whose filename contains this substring (e.g. 20260811_150000).",
-    )
-    hist_p.add_argument(
         "--min-calls",
         type=int,
         default=30,
         metavar="N",
-        help="Ignore statements with fewer than N calls in the analyzed window.",
-    )
-    hist_p.add_argument(
-        "--min-tier",
-        choices=list(MIN_TIER_CHOICES),
-        default="high",
-        help="Only show rows at or above this confidence tier (use 'all' to show every row).",
-    )
-    hist_p.add_argument(
-        "--fdr-correct",
-        dest="fdr_correct",
-        action="store_true",
-        default=True,
-        help="Apply Benjamini-Hochberg FDR correction across dip p-values (on by default).",
-    )
-    hist_p.add_argument(
-        "--no-fdr-correct",
-        dest="fdr_correct",
-        action="store_false",
-        help="Disable FDR correction.",
-    )
-    hist_p.add_argument(
-        "--fdr-q",
-        type=float,
-        default=0.05,
-        metavar="Q",
-        help="Target false discovery rate for the BH correction.",
-    )
-    hist_p.add_argument(
-        "--flagged-only",
-        action="store_true",
-        help="Only show statements flagged as multimodal.",
-    )
-    hist_p.add_argument(
-        "--json",
-        dest="as_json",
-        action="store_true",
-        help="Emit JSON ({results, template_groups, mode, snapshots, fdr, ...}).",
-    )
-    hist_p.add_argument(
-        "--write",
-        action="store_true",
-        help=(
-            "Instead of printing, write an ybtop.latency.*.json analysis sidecar next to the "
-            "selected snapshot (cumulative + delta, unfiltered) and record it in the manifest, "
-            "so the browser viewer shows dip-confirmed tiers offline. Use --all for every "
-            "snapshot in the directory."
-        ),
-    )
-    hist_p.add_argument(
-        "--all",
-        dest="write_all",
-        action="store_true",
-        help="With --write, produce analysis sidecars for every snapshot in the manifest.",
+        help="Ignore statements with fewer than N calls in the snapshot.",
     )
     return p
 
@@ -709,33 +634,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         return
 
     if args.command == "histogram":
-        if getattr(args, "write", False):
-            from ybtop.histogram_report import run_histogram_write
-
-            run_histogram_write(
-                data_dir=args.data_dir,
-                index=args.index,
-                snapshot=args.snapshot,
-                write_all=bool(getattr(args, "write_all", False)),
-                min_calls=args.min_calls,
-                fdr_q=args.fdr_q,
-            )
-            return
-
         from ybtop.histogram_report import run_histogram
 
-        run_histogram(
-            data_dir=args.data_dir,
-            mode=args.mode,
-            index=args.index,
-            snapshot=args.snapshot,
-            min_calls=args.min_calls,
-            min_tier=args.min_tier,
-            fdr_correct=args.fdr_correct,
-            fdr_q=args.fdr_q,
-            flagged_only=args.flagged_only,
-            as_json=args.as_json,
-        )
+        run_histogram(data_dir=args.data_dir, min_calls=args.min_calls)
         return
 
     settings = _settings_from_args(args)
