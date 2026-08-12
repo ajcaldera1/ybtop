@@ -1,4 +1,4 @@
-"""Multimodality detection for latency histograms (ported from yb_histogram_multimodality.py).
+"""Multimodality detection for latency histograms
 
 Tiered pipeline in :func:`detect_modes`:
 
