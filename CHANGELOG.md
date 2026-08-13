@@ -2,6 +2,17 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [0.1.13] — 2026-08-12
+
+### Added
+
+- **Browser (query-template grouping across statement/ASH panels):** The **pg_stat_statements**, **ycql_stat_statements**, and **ASH** tabs now expose the same query-template grouping the Latency-modes tab uses (IN-list arity, bulk **`VALUES (...),(...),…`** row-lists, and per-call comments normalized; table/column names preserved). Each panel gains a **`tmpl`** column tagging every row with its `rank/count` within a template, a **Recurring query templates** summary table (templates with more than one member, aggregated by `total time`/`time %` for statements and `Active Sessions/sec`/`Load %` for ASH), and a **Group by query template** toggle that collapses the main table to one row per template (with a `queries` count). Grouping works in both **cumulative** and **delta** modes, aggregating raw counters so collapsed rows flow through the existing time-% / delta pipeline. YCQL notes that only `IN (...)` list arity is normalized (it uses `?` bind markers). Grouping is browser-only — the normalizer is kept byte-identical to the Python `normalize_query_template`, so no snapshot format change is required.
+
+### Changed
+
+- **Query-template normalization (CLI + viewer):** `normalize_query_template` (and its byte-identical browser twin) now also collapses a bulk **`VALUES (...),(...),…`** row-list — any number of rows, one level of nested parens allowed per row for casts/function calls — to a canonical **`VALUES (...)`**. This folds multi-row upserts/bulk updates such as `UPDATE t AS x SET … FROM (VALUES (...)) WHERE …` into a single template regardless of row count, affecting Latency-modes template grouping and the new statement/ASH panel grouping.
+- **`IN (...)` normalization now skips subqueries:** only a **value-list** `IN (...)` (literals / `$N`) is collapsed; a subquery **`IN (SELECT …)`** (e.g. `DELETE FROM t WHERE c IN (SELECT c FROM t WHERE …)`) is left intact so semantically distinct subquery predicates no longer fold into the same template.
+
 ## [0.1.12] — 2026-08-11
 
 ### Added
