@@ -877,6 +877,26 @@ tr:nth-child(even) {
   margin: -0.35rem 0 0.75rem;
 }
 
+.tmpl-group-control {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin: 0 0 0.75rem;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--yb-border);
+  border-radius: 5px;
+  background: var(--yb-panel, #12181f);
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--yb-text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.tmpl-group-control input {
+  cursor: pointer;
+}
+
 .err-banner {
   background: #3a1520;
   color: #ffc9c9;

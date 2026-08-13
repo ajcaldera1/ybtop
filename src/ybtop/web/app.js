@@ -148,6 +148,15 @@
   let ashNodeIdFilter = null;
   let ashTableIdFilter = null;
 
+  /**
+   * "Group by query template" toggles (per panel). When on, statements/ASH rows are collapsed by
+   * their normalized query template (IN-list arity and per-call comments ignored). Flipping a
+   * toggle re-renders from the retained snapshot, matching the ASH-filter navigation pattern.
+   */
+  let pgssGroupByTemplate = false;
+  let ycqlGroupByTemplate = false;
+  let ashGroupByTemplate = false;
+
   const VIEWER_SECTION_IDS = ["pgss", "ycql", "ash", "tablets", "latency"];
 
   /**
@@ -2100,6 +2109,8 @@
    */
   const MONO_TABLE_CELL_KEYS = new Set([
     "query",
+    "template",
+    "queryids",
     "queryid",
     "query_id",
     "namespace_name",
@@ -2595,7 +2606,7 @@
     }
   }
 
-  function buildSortableTable(title, rows, columns, subsectionId, ashCellOpts) {
+  function buildSortableTable(title, rows, columns, subsectionId, ashCellOpts, initialSort) {
     const section = el("section", { className: "ybtop-section" });
     const body = el("div", { className: "section-body" });
     if (subsectionId) {
@@ -2618,7 +2629,13 @@
       body.appendChild(el("p", { textContent: "(no rows)" }));
       return section;
     }
-    const state = { key: columns[0].key, dir: "desc" };
+    const hasInitial =
+      initialSort &&
+      initialSort.key &&
+      columns.some((c) => c.key === initialSort.key && c.sortable !== false);
+    const state = hasInitial
+      ? { key: initialSort.key, dir: initialSort.dir || "desc" }
+      : { key: columns[0].key, dir: "desc" };
 
     const table = el("table");
     const thead = el("thead");
@@ -3536,16 +3553,244 @@
   }
 
   const HIST_REWRITE_COMMENT_RE = /\/\*[\s\S]*?\*\//g;
-  const HIST_IN_LIST_RE = /\bIN\s*\([^)]*\)/gi;
+  // Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
+  const HIST_IN_LIST_RE = /\bIN\s*\((?!\s*SELECT\b)[^)]*\)/gi;
+  // Bulk VALUES row-list — collapse `VALUES (...),(...),...` (any row count, one level of nested
+  // parens allowed per row) to a canonical `VALUES (...)`. Kept identical to the Python
+  // _VALUES_LIST_RE so grouping matches across the CLI and every panel.
+  const HIST_VALUES_LIST_RE = /\bVALUES\s*\((?:[^()]|\([^()]*\))*\)(?:\s*,\s*\((?:[^()]|\([^()]*\))*\))*/gi;
   const HIST_PLACEHOLDER_RE = /\$\d+/g;
 
   function normalizeQueryTemplate(query) {
     if (!query) return "";
     let q = String(query).replace(HIST_REWRITE_COMMENT_RE, "");
     q = q.replace(HIST_IN_LIST_RE, "IN (...)");
+    q = q.replace(HIST_VALUES_LIST_RE, "VALUES (...)");
     q = q.replace(HIST_PLACEHOLDER_RE, "$N");
     q = q.replace(/\s+/g, " ").trim();
     return q;
+  }
+
+  // --- Shared query-template grouping for the statement/ASH panels ------------------------------
+  // These reuse normalizeQueryTemplate (kept byte-identical to the Python normalize_query_template
+  // in src/ybtop/histogram.py) so a template collapses the same way in every panel and in the CLI.
+
+  /**
+   * Tag each display row in place with query_template / template_rank / template_member_count and a
+   * ready-to-render `tmpl` string ("rank/count", blank for singletons). Ranks within a template are
+   * ordered by `primaryMetricKey` (default total_ms) descending.
+   */
+  function tagRowsWithTemplate(rows, primaryMetricKey) {
+    const mk = primaryMetricKey || "total_ms";
+    const groups = new Map();
+    (rows || []).forEach((r) => {
+      const key = normalizeQueryTemplate(r.query);
+      r.query_template = key;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    groups.forEach((members) => {
+      members.sort((a, b) => (Number(b[mk]) || 0) - (Number(a[mk]) || 0));
+      members.forEach((r, i) => {
+        r.template_rank = i + 1;
+        r.template_member_count = members.length;
+        r.tmpl = members.length > 1 ? `${i + 1}/${members.length}` : "";
+      });
+    });
+    return groups;
+  }
+
+  /**
+   * Collapse merged statement rows (pg_stat / ycql shape, carrying `_deltaSrc`) into one row per
+   * query template. Aggregates the raw totals so the row keeps the exact same shape as
+   * mergeStatements() output (including a fresh `_deltaSrc` and recomputed per-call fields), which
+   * lets it flow through the existing delta / time-% pipeline unchanged. The stable per-template
+   * identity (`queryid` = the template text, `dbname` = null) makes delta keying line up across
+   * snapshots.
+   */
+  function collapseStatementsByTemplate(mergedRows) {
+    const hasRows = (mergedRows || []).some((r) => Object.prototype.hasOwnProperty.call(r, "rows"));
+    const hasDbname = (mergedRows || []).some((r) =>
+      Object.prototype.hasOwnProperty.call(r, "dbname")
+    );
+    const hasPrepared = (mergedRows || []).some((r) =>
+      Object.prototype.hasOwnProperty.call(r, "is_prepared")
+    );
+    const groups = new Map();
+    (mergedRows || []).forEach((r) => {
+      const key = normalizeQueryTemplate(r.query);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    const out = [];
+    groups.forEach((members, key) => {
+      let calls = 0;
+      let exec = 0;
+      let rows = 0;
+      const doc = {};
+      const dbs = new Set();
+      const queryids = [];
+      let anyPrepared = false;
+      members.forEach((m) => {
+        const s = deltaSrcFromRowFallback(m);
+        calls += Number(s.calls) || 0;
+        exec += Number(s.total_exec_time) || 0;
+        if (s.rows != null) rows += Number(s.rows) || 0;
+        if (s.doc) {
+          Object.keys(s.doc).forEach((k) => {
+            doc[k] = (doc[k] || 0) + (Number(s.doc[k]) || 0);
+          });
+        }
+        if (m.dbname != null && String(m.dbname).trim() !== "") dbs.add(String(m.dbname).trim());
+        if (m.queryid != null) queryids.push(String(m.queryid));
+        if (ycqlPreparedTruthy(m.is_prepared)) anyPrepared = true;
+      });
+      const row = {
+        queryid: key,
+        query: key,
+        calls: calls,
+        total_ms: Math.round(exec * 100) / 100,
+        mean_ms: calls ? Math.round((exec / calls) * 100) / 100 : 0,
+        _tmpl_member_count: members.length,
+        _tmpl_queryids: queryids,
+      };
+      if (hasDbname) row.dbname = null;
+      if (hasPrepared) row.is_prepared = anyPrepared;
+      if (hasRows) {
+        row.rows = Math.round(rows * 100) / 100;
+        row.rows_per_call = calls ? Math.round((rows / calls) * 100) / 100 : 0;
+      }
+      Object.keys(doc).forEach((k) => {
+        row[`${k}_per_call`] = calls ? Math.round((doc[k] / calls) * 100) / 100 : 0;
+      });
+      const deltaSrc = { calls: calls, total_exec_time: exec, doc: doc };
+      if (hasRows) deltaSrc.rows = rows;
+      row._deltaSrc = deltaSrc;
+      out.push(row);
+    });
+    out.sort((a, b) => b.total_ms - a.total_ms);
+    return out;
+  }
+
+  /** Summary rows (member_count > 1) for the statement panels' "Recurring query templates" table. */
+  function statementTemplateSummaryRows(rows) {
+    const groups = new Map();
+    (rows || []).forEach((r) => {
+      const key = normalizeQueryTemplate(r.query);
+      if (!groups.has(key)) {
+        groups.set(key, { template: key, members: 0, calls: 0, total_ms: 0, queryids: [] });
+      }
+      const g = groups.get(key);
+      g.members += 1;
+      g.calls += Number(r.calls) || 0;
+      g.total_ms += Number(r.total_ms) || 0;
+      if (r.queryid != null) g.queryids.push(String(r.queryid));
+    });
+    const all = Array.from(groups.values());
+    const totalMs = all.reduce((s, g) => s + g.total_ms, 0);
+    return all
+      .filter((g) => g.members > 1)
+      .map((g) => ({
+        members: g.members,
+        calls: g.calls,
+        total_ms: Math.round(g.total_ms * 100) / 100,
+        time_pct: totalMs > 0 ? Math.round(10000 * (g.total_ms / totalMs)) / 100 : 0,
+        queryids: g.queryids.join(", "),
+        template: g.template,
+      }))
+      .sort((a, b) => b.total_ms - a.total_ms);
+  }
+
+  // Sort/metric columns stay on the left (matching the panel's original layout); the
+  // template-identity columns (`queries`/`tmpl`) sit to the right of the query text.
+  function statementTemplateSummaryColumns() {
+    return [
+      { key: "calls", label: "calls", type: "number", align: "right" },
+      { key: "total_ms", label: "total time (ms)", type: "number", align: "right" },
+      { key: "time_pct", label: "time %", type: "number", align: "right" },
+      { key: "template", label: "query template" },
+      { key: "members", label: "queries", type: "number", align: "right" },
+      { key: "queryids", label: "queryids" },
+    ];
+  }
+
+  /** Sort of the "Recurring query templates" tables — mirrors the statement panel (total time desc). */
+  const STATEMENT_TEMPLATE_SUMMARY_SORT = { key: "total_ms", dir: "desc" };
+
+  /** Insert a `tmpl` column just after the `query` column (ungrouped statement tables). */
+  function withTmplColumn(baseCols) {
+    const cols = [];
+    let inserted = false;
+    (baseCols || []).forEach((c) => {
+      cols.push(c);
+      if (!inserted && c.key === "query") {
+        cols.push({ key: "tmpl", label: "tmpl" });
+        inserted = true;
+      }
+    });
+    if (!inserted) cols.push({ key: "tmpl", label: "tmpl" });
+    return cols;
+  }
+
+  /** Columns for a template-collapsed statement table: drop per-statement id/db, add a count
+   *  immediately to the right of the query text (sort/metric columns stay on the left). */
+  function groupedStatementColumns(baseCols) {
+    const cols = [];
+    let inserted = false;
+    (baseCols || []).forEach((c) => {
+      if (c.key === "queryid" || c.key === "dbname" || c.key === "tmpl") return;
+      cols.push(c);
+      if (!inserted && c.key === "query") {
+        cols.push({ key: "_tmpl_member_count", label: "queries", type: "number", align: "right" });
+        inserted = true;
+      }
+    });
+    if (!inserted) {
+      cols.push({ key: "_tmpl_member_count", label: "queries", type: "number", align: "right" });
+    }
+    return cols;
+  }
+
+  /** ASH sample grouping by normalized query template; sums samples, counts distinct query_ids. */
+  function groupAshByTemplate(rows) {
+    const m = new Map();
+    (rows || []).forEach((r) => {
+      const q = r.query != null && r.query !== undefined ? String(r.query) : "";
+      const key = normalizeQueryTemplate(q) || "\0__no_query__";
+      if (!m.has(key)) {
+        m.set(key, {
+          query_template: key === "\0__no_query__" ? "" : key,
+          query: key === "\0__no_query__" ? "" : key,
+          query_id: r.query_id != null && r.query_id !== undefined ? r.query_id : null,
+          samples: 0,
+          _members: new Set(),
+        });
+      }
+      const ent = m.get(key);
+      ent.samples += Number(r.samples) || 0;
+      if ((ent.query_id == null || ent.query_id === "") && r.query_id != null) ent.query_id = r.query_id;
+      if (r.query_id != null && String(r.query_id).trim() !== "") ent._members.add(String(r.query_id).trim());
+    });
+    return Array.from(m.values())
+      .map((e) => ({
+        query_template: e.query_template,
+        query: e.query,
+        query_id: e.query_id,
+        samples: e.samples,
+        members: e._members.size || 1,
+      }))
+      .sort((a, b) => b.samples - a.samples);
+  }
+
+  /** Small reusable "Group by query template" checkbox control. */
+  function buildGroupByTemplateControl(checked, onChange) {
+    const wrap = el("label", { className: "tmpl-group-control" });
+    const chk = el("input", { type: "checkbox" });
+    chk.checked = !!checked;
+    chk.addEventListener("change", () => onChange(chk.checked));
+    wrap.appendChild(chk);
+    wrap.appendChild(el("span", { textContent: "Group by query template" }));
+    return wrap;
   }
 
   function groupByTemplate(results) {
@@ -3919,23 +4164,14 @@
     if (st) {
       const merged = mergeStatements(st);
       const prevSt = prevDoc && prevDoc.pg_stat_statements && prevDoc.pg_stat_statements.per_node;
-      let pgTitle = "Top 25 — pg_stat_statements";
-      let pgRows = withPgStatTimePercent(merged);
-      let pgCols = pgStatStatementColumns(pgRows, st);
+      const isDelta = !!(prevDoc && prevSt);
+      const grouped = pgssGroupByTemplate;
       const pgSort = { key: "total_ms", dir: "desc" };
-      if (prevDoc && prevSt) {
-        const mergedPrev = mergeStatements(prevSt);
-        const deltaRows = deltaPgStatMergedRows(merged, mergedPrev);
+
+      if (isDelta) {
         panelPgss.appendChild(
           pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc, curFile)
         );
-        pgTitle = "Top 25 — pg_stat_statements (Δ vs prior snapshot)";
-        pgRows = withPgStatDeltaDerivedRows(
-          deltaRows,
-          prevDoc.generated_at_utc,
-          doc.generated_at_utc
-        );
-        pgCols = pgStatStatementColumnsDelta(pgRows, st);
       } else {
         panelPgss.appendChild(pgStatActivityBannerAt(doc.generated_at_utc, curFile));
         if (prevDoc && !prevSt) {
@@ -3948,10 +4184,80 @@
           );
         }
       }
+
+      // Ungrouped display rows (used for the summary and the tmpl column).
+      let baseRows;
+      if (isDelta) {
+        baseRows = withPgStatDeltaDerivedRows(
+          deltaPgStatMergedRows(merged, mergeStatements(prevSt)),
+          prevDoc.generated_at_utc,
+          doc.generated_at_utc
+        );
+      } else {
+        baseRows = withPgStatTimePercent(merged);
+      }
+
+      panelPgss.appendChild(
+        buildGroupByTemplateControl(grouped, (v) => {
+          pgssGroupByTemplate = v;
+          if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+        })
+      );
+
+      const pgSummary = statementTemplateSummaryRows(baseRows);
+      if (pgSummary.length) {
+        panelPgss.appendChild(
+          buildSortableTable(
+            `Recurring query templates (${pgSummary.length})`,
+            pgSummary,
+            statementTemplateSummaryColumns(),
+            "sec-pgss-templates",
+            undefined,
+            STATEMENT_TEMPLATE_SUMMARY_SORT
+          )
+        );
+      }
+
+      let pgTitle;
+      let pgRows;
+      let pgCols;
+      if (grouped) {
+        if (isDelta) {
+          const collapsedCur = collapseStatementsByTemplate(merged);
+          const collapsedPrev = collapseStatementsByTemplate(mergeStatements(prevSt));
+          const memberByKey = new Map(
+            collapsedCur.map((r) => [String(r.queryid), r._tmpl_member_count])
+          );
+          pgRows = withPgStatDeltaDerivedRows(
+            deltaPgStatMergedRows(collapsedCur, collapsedPrev),
+            prevDoc.generated_at_utc,
+            doc.generated_at_utc
+          );
+          pgRows.forEach((r) => {
+            r._tmpl_member_count = memberByKey.get(String(r.queryid)) || 1;
+          });
+          pgCols = groupedStatementColumns(pgStatStatementColumnsDelta(pgRows, st));
+          pgTitle = "pg_stat_statements by template (Δ vs prior snapshot)";
+        } else {
+          pgRows = withPgStatTimePercent(collapseStatementsByTemplate(merged));
+          pgCols = groupedStatementColumns(pgStatStatementColumns(pgRows, st));
+          pgTitle = "pg_stat_statements by template";
+        }
+      } else {
+        pgRows = baseRows;
+        tagRowsWithTemplate(pgRows);
+        pgCols = withTmplColumn(
+          isDelta ? pgStatStatementColumnsDelta(pgRows, st) : pgStatStatementColumns(pgRows, st)
+        );
+        pgTitle = isDelta
+          ? "Top 25 — pg_stat_statements (Δ vs prior snapshot)"
+          : "Top 25 — pg_stat_statements";
+      }
+
       panelPgss.appendChild(
         buildSortablePaginatedTable(pgTitle, pgRows, pgCols, 25, "sec-pgss-main", pgSort, {
           unifyStatementHeaders: true,
-          pgssAshLinks: true,
+          pgssAshLinks: !grouped,
         })
       );
     } else {
@@ -3967,29 +4273,14 @@
       const mergedYcql = mergeYcqlStatements(ycqlSt);
       const prevYcqlSt =
         prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
-      let ycqlTitle = "Top 25 — ycql_stat_statements";
-      let ycqlRows = withPgStatTimePercent(mergedYcql);
-      let ycqlCols = ycqlStatStatementColumns();
+      const isDelta = !!(prevDoc && prevYcqlSt);
+      const grouped = ycqlGroupByTemplate;
       const ycqlSort = { key: "total_ms", dir: "desc" };
-      if (prevDoc && prevYcqlSt) {
-        const mergedYcqlPrev = mergeYcqlStatements(prevYcqlSt);
-        const prepByKey = new Map(
-          mergedYcql.map((r) => [statementMergeKey(r), !!r.is_prepared])
-        );
-        const deltaYcqlRows = deltaPgStatMergedRows(mergedYcql, mergedYcqlPrev).map((r) => ({
-          ...r,
-          is_prepared: prepByKey.get(statementMergeKey(r)) || false,
-        }));
+
+      if (isDelta) {
         panelYcql.appendChild(
           pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc, curFile)
         );
-        ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
-        ycqlRows = withPgStatDeltaDerivedRows(
-          deltaYcqlRows,
-          prevDoc.generated_at_utc,
-          doc.generated_at_utc
-        );
-        ycqlCols = ycqlStatStatementColumnsDelta();
       } else {
         panelYcql.appendChild(pgStatActivityBannerAt(doc.generated_at_utc, curFile));
         if (prevDoc && !prevYcqlSt) {
@@ -4002,6 +4293,94 @@
           );
         }
       }
+
+      let baseRows;
+      if (isDelta) {
+        const mergedYcqlPrev = mergeYcqlStatements(prevYcqlSt);
+        const prepByKey = new Map(mergedYcql.map((r) => [statementMergeKey(r), !!r.is_prepared]));
+        const deltaYcqlRows = deltaPgStatMergedRows(mergedYcql, mergedYcqlPrev).map((r) => ({
+          ...r,
+          is_prepared: prepByKey.get(statementMergeKey(r)) || false,
+        }));
+        baseRows = withPgStatDeltaDerivedRows(
+          deltaYcqlRows,
+          prevDoc.generated_at_utc,
+          doc.generated_at_utc
+        );
+      } else {
+        baseRows = withPgStatTimePercent(mergedYcql);
+      }
+
+      panelYcql.appendChild(
+        buildGroupByTemplateControl(grouped, (v) => {
+          ycqlGroupByTemplate = v;
+          if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+        })
+      );
+      panelYcql.appendChild(
+        el("div", {
+          className: "pgss-activity-note",
+          textContent:
+            "YCQL uses ? bind markers, so only IN (...) list arity is normalized when grouping templates.",
+        })
+      );
+
+      const ycqlSummary = statementTemplateSummaryRows(baseRows);
+      if (ycqlSummary.length) {
+        panelYcql.appendChild(
+          buildSortableTable(
+            `Recurring query templates (${ycqlSummary.length})`,
+            ycqlSummary,
+            statementTemplateSummaryColumns(),
+            "sec-ycql-templates",
+            undefined,
+            STATEMENT_TEMPLATE_SUMMARY_SORT
+          )
+        );
+      }
+
+      let ycqlTitle;
+      let ycqlRows;
+      let ycqlCols;
+      if (grouped) {
+        if (isDelta) {
+          const collapsedCur = collapseStatementsByTemplate(mergedYcql);
+          const collapsedPrev = collapseStatementsByTemplate(mergeYcqlStatements(prevYcqlSt));
+          const prepByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), !!r.is_prepared])
+          );
+          const memberByKey = new Map(
+            collapsedCur.map((r) => [String(r.queryid), r._tmpl_member_count])
+          );
+          ycqlRows = withPgStatDeltaDerivedRows(
+            deltaPgStatMergedRows(collapsedCur, collapsedPrev).map((r) => ({
+              ...r,
+              is_prepared: prepByKey.get(statementMergeKey(r)) || false,
+            })),
+            prevDoc.generated_at_utc,
+            doc.generated_at_utc
+          );
+          ycqlRows.forEach((r) => {
+            r._tmpl_member_count = memberByKey.get(String(r.queryid)) || 1;
+          });
+          ycqlCols = groupedStatementColumns(ycqlStatStatementColumnsDelta());
+          ycqlTitle = "ycql_stat_statements by template (Δ vs prior snapshot)";
+        } else {
+          ycqlRows = withPgStatTimePercent(collapseStatementsByTemplate(mergedYcql));
+          ycqlCols = groupedStatementColumns(ycqlStatStatementColumns());
+          ycqlTitle = "ycql_stat_statements by template";
+        }
+      } else {
+        ycqlRows = baseRows;
+        tagRowsWithTemplate(ycqlRows);
+        ycqlCols = withTmplColumn(
+          isDelta ? ycqlStatStatementColumnsDelta() : ycqlStatStatementColumns()
+        );
+        ycqlTitle = isDelta
+          ? "Top 25 — ycql_stat_statements (Δ vs prior snapshot)"
+          : "Top 25 — ycql_stat_statements";
+      }
+
       panelYcql.appendChild(
         buildSortablePaginatedTable(
           ycqlTitle,
@@ -4010,7 +4389,7 @@
           25,
           "sec-ycql-main",
           ycqlSort,
-          { unifyStatementHeaders: true, pgssAshLinks: true }
+          { unifyStatementHeaders: true, pgssAshLinks: !grouped }
         )
       );
     } else {
@@ -4205,6 +4584,49 @@
           ashPaginatedOpts
         )
       );
+
+      // Query-template grouping for ASH samples. Meaningless when already scoped to one query id.
+      if (!qF) {
+        // Sort columns (Active Sessions/sec, Load %) stay on the left; the `queries` count sits to
+        // the right of the query text, matching the ASH panel's original by-query layout/sort.
+        const ashTemplateCols = [
+          ASH_SPS_COL,
+          ASH_LOAD_COL,
+          { key: "query", label: "query" },
+          { key: "members", label: "queries", type: "number", align: "right" },
+          { key: "query_id", label: "query_id" },
+        ];
+        const byTemplateL = ashEnriched(groupAshByTemplate(mergedAsh));
+        panelAsh.appendChild(
+          buildGroupByTemplateControl(ashGroupByTemplate, (v) => {
+            ashGroupByTemplate = v;
+            if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+          })
+        );
+        const ashTemplateSummary = byTemplateL.filter((r) => (Number(r.members) || 1) > 1);
+        if (ashTemplateSummary.length) {
+          panelAsh.appendChild(
+            buildSortableTable(
+              `Recurring query templates (${ashTemplateSummary.length})`,
+              ashTemplateSummary,
+              ashTemplateCols,
+              "sec-ash-templates",
+              ashReportCellOpts
+            )
+          );
+        }
+        if (ashGroupByTemplate) {
+          panelAsh.appendChild(
+            buildSortableTable(
+              `Active Sessions/Sec Grouped By: Query Template (${byTemplateL.length} groups)`,
+              byTemplateL,
+              ashTemplateCols,
+              "sec-ash-by-template",
+              ashReportCellOpts
+            )
+          );
+        }
+      }
 
       if (tableF) {
         let byQueryId = groupAshByQueryId(mergedAsh);
