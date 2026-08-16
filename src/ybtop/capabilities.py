@@ -15,6 +15,7 @@ class Capabilities:
     pg_stat_use_exec_time: bool
     yb_ash_range_function: bool
     pg_stat_docdb_metrics: bool
+    pg_stat_latency_histogram: bool
 
     @staticmethod
     def detect(conn: psycopg.Connection) -> Capabilities:
@@ -22,6 +23,7 @@ class Capabilities:
             pg_stat_use_exec_time=_pg_stat_use_exec_time_columns(conn),
             yb_ash_range_function=_yb_ash_two_arg_range_function_exists(conn),
             pg_stat_docdb_metrics=_pg_stat_has_docdb_seeks(conn),
+            pg_stat_latency_histogram=_pg_stat_has_latency_histogram(conn),
         )
 
 
@@ -72,6 +74,16 @@ def _pg_stat_has_docdb_seeks(conn: psycopg.Connection) -> bool:
     """Newer Yugabyte exposes DocDB counters on pg_stat_statements (probe docdb_seeks)."""
     try:
         fetch_all(conn, "SELECT docdb_seeks FROM pg_stat_statements LIMIT 0")
+        return True
+    except pg_errors.UndefinedColumn:
+        conn.rollback()
+        return False
+
+
+def _pg_stat_has_latency_histogram(conn: psycopg.Connection) -> bool:
+    """YugabyteDB exposes a per-statement yb_latency_histogram column on pg_stat_statements."""
+    try:
+        fetch_all(conn, "SELECT yb_latency_histogram FROM pg_stat_statements LIMIT 0")
         return True
     except pg_errors.UndefinedColumn:
         conn.rollback()

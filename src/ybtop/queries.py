@@ -100,10 +100,28 @@ def pg_stat_statements_raw(conn: psycopg.Connection, caps: Capabilities) -> list
     return fetch_all(conn, sql)
 
 
-def pg_stat_statements_top(conn: psycopg.Connection, limit: int, caps: Capabilities) -> list[dict[str, Any]]:
+def pg_stat_statements_top(
+    conn: psycopg.Connection,
+    limit: int,
+    caps: Capabilities,
+    *,
+    include_latency_histogram: bool = False,
+) -> list[dict[str, Any]]:
+    """Top-N statements by total time (``total_exec_time`` / ``total_time``).
+
+    When ``include_latency_histogram`` is set and the cluster exposes
+    ``yb_latency_histogram``, that column is selected as
+    ``COALESCE(..., '{}'::jsonb)`` so NULL histograms become empty JSON objects.
+    Callers that build the latency-modes section should ignore empty histograms.
+    """
     time_cols = _pg_stat_time_select(caps)
     extra = _pg_stat_rows_and_docdb(caps)
     order_by = _pg_stat_order_by_time(caps)
+    hist_col = ""
+    if include_latency_histogram and caps.pg_stat_latency_histogram:
+        hist_col = (
+            ",\n        COALESCE(s.yb_latency_histogram, '{}'::jsonb) AS yb_latency_histogram"
+        )
     sql = f"""
     SELECT
         s.queryid::text AS queryid,
@@ -111,7 +129,7 @@ def pg_stat_statements_top(conn: psycopg.Connection, limit: int, caps: Capabilit
         s.calls::bigint AS calls,
         {time_cols},
         {extra},
-        NULLIF(BTRIM(db.datname::text), '') AS dbname
+        NULLIF(BTRIM(db.datname::text), '') AS dbname{hist_col}
     FROM pg_stat_statements s
     LEFT JOIN pg_database db ON db.oid = s.dbid
     ORDER BY {order_by}

@@ -782,6 +782,87 @@ tr:nth-child(even) {
   font-weight: 700;
 }
 
+.latency-banner-title {
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+.latency-legend {
+  margin: 0 0 0.9rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--yb-border);
+  border-left: 3px solid var(--yb-accent, #35c46a);
+  border-radius: 5px;
+  background: var(--yb-panel, #12181f);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.latency-legend-title {
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+}
+
+.latency-legend-row {
+  display: flex;
+  gap: 0.55rem;
+  align-items: baseline;
+  margin: 0.2rem 0;
+}
+
+.latency-legend-key {
+  flex: 0 0 auto;
+  min-width: 3.5rem;
+  padding: 0.02rem 0.35rem;
+  border-radius: 3px;
+  font-weight: 600;
+  color: var(--yb-text);
+  background: rgba(53, 196, 106, 0.12);
+  border: 1px solid var(--yb-border);
+}
+
+.latency-legend-val {
+  color: var(--yb-muted, #9aa7b4);
+}
+
+.latency-confirmed-badge {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+  color: var(--yb-bg, #0b0f14);
+  background: var(--yb-accent, #35c46a);
+}
+
+.latency-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  margin: 0 0 0.85rem;
+  font-size: 0.85rem;
+}
+
+.latency-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--yb-text);
+}
+
+.latency-control select {
+  background: var(--yb-panel, #12181f);
+  color: var(--yb-text);
+  border: 1px solid var(--yb-border);
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  font: inherit;
+}
+
 .pgss-activity-mono {
   font-variant-numeric: tabular-nums;
 }

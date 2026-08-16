@@ -18,7 +18,12 @@ import psycopg.conninfo
 
 from ybtop import queries as Q
 from ybtop.capabilities import Capabilities, detect_capabilities
-from ybtop.config import DEFAULT_NODE_PARALLELISM, MANIFEST_FILENAME, SNAPSHOT_FILE_PREFIX
+from ybtop.config import (
+    DEFAULT_NODE_PARALLELISM,
+    LATENCY_ANALYSIS_FILE_PREFIX,
+    MANIFEST_FILENAME,
+    SNAPSHOT_FILE_PREFIX,
+)
 from ybtop.db import connect
 from ybtop.log import get_logger, log_event, stage_timer, summary_scope
 from ybtop.merge import top_ash_table_ids
@@ -39,6 +44,73 @@ def _json_default(obj: Any) -> Any:
 def _serialize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return JSON-serializable copies (datetime/decimal safe)."""
     return json.loads(json.dumps(rows, default=_json_default))
+
+
+def normalize_latency_histogram(raw: Any) -> dict[str, int]:
+    """Canonicalize a ``yb_latency_histogram`` value to a flat ``{bucket_label: count}`` map.
+
+    YugabyteDB returns the column as a JSON array of single-key objects
+    (``[{"[0.0,1.0)": 6}, {"[1.0,2.0)": 2}]``); older/mocked shapes may already be a flat
+    object or a JSON string. Storing one canonical flat map keeps cross-node merge and
+    inter-snapshot delta trivial (sum / subtract by label) and detection encoding-agnostic.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    items: list[tuple[Any, Any]] = []
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    elif isinstance(raw, list):
+        for el in raw:
+            if isinstance(el, dict):
+                items.extend(el.items())
+    else:
+        return {}
+    out: dict[str, int] = {}
+    for k, v in items:
+        try:
+            cnt = int(v)
+        except (TypeError, ValueError):
+            continue
+        label = str(k)
+        out[label] = out.get(label, 0) + cnt
+    return out
+
+
+def _normalize_latency_histogram_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build latency-histogram section rows from a pg_stat_statements pull.
+
+    Empty histograms (NULL coalesced to ``{}`` at query time, or otherwise empty / all-zero
+    after normalization) are dropped so later merge/delta/detection ignore them.
+    """
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        buckets = {
+            label: cnt
+            for label, cnt in normalize_latency_histogram(r.get("yb_latency_histogram")).items()
+            if cnt > 0
+        }
+        if not buckets:
+            continue
+        out.append(
+            {
+                "queryid": r.get("queryid"),
+                "query": r.get("query"),
+                "dbname": r.get("dbname"),
+                "calls": int(r.get("calls") or 0),
+                "yb_latency_histogram": buckets,
+            }
+        )
+    return out
+
+
+def _strip_latency_histogram_column(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop ``yb_latency_histogram`` from statement rows before storing pg_stat_statements."""
+    return [{k: v for k, v in r.items() if k != "yb_latency_histogram"} for r in rows]
 
 
 def _atomic_write_json(path: Path, payload: Any, *, compress: bool = False) -> None:
@@ -74,6 +146,7 @@ def build_snapshot_document(
     ensure_ycql_extension: bool = False,
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
+    latency_histograms: bool = False,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     with stage_timer("build_snapshot", _log, scope_total=True):
@@ -87,6 +160,7 @@ def build_snapshot_document(
                 ensure_ycql_extension=ensure_ycql_extension,
                 ash_top_tables=ash_top_tables,
                 collect_table_ddl=collect_table_ddl,
+                latency_histograms=latency_histograms,
                 node_parallelism=node_parallelism,
             )
 
@@ -98,6 +172,7 @@ class _NodeCollectResult:
     ycql: list[dict[str, Any]]
     ash: list[dict[str, Any]]
     tablets: list[dict[str, Any]]
+    latency_histograms: list[dict[str, Any]]
 
 
 def _collect_one_node(
@@ -111,14 +186,28 @@ def _collect_one_node(
     ash_window_sec: float,
     statements_per_node: int,
     ash_per_node: int,
+    collect_latency_histograms: bool,
 ) -> _NodeCollectResult:
     nid = node_id(node)
     dsn = dsn_for_node(seed_dsn, node)
+    latency_histograms: list[dict[str, Any]] = []
+    want_hist = collect_latency_histograms and caps.pg_stat_latency_histogram
     with stage_timer("collect_node", _log, node_id=nid, node_total=True, node_count=node_count):
         with connect(dsn) as conn:
             with stage_timer("pg_stat_statements_top", _log, node_id=nid) as st:
-                pg_stat = _serialize_rows(Q.pg_stat_statements_top(conn, statements_per_node, caps))
-                st.row_count = len(pg_stat)
+                pg_stat_raw = _serialize_rows(
+                    Q.pg_stat_statements_top(
+                        conn,
+                        statements_per_node,
+                        caps,
+                        include_latency_histogram=want_hist,
+                    )
+                )
+                st.row_count = len(pg_stat_raw)
+            if want_hist:
+                # Same top-N-by-time pull; empty COALESCE'd histograms are dropped.
+                latency_histograms = _normalize_latency_histogram_rows(pg_stat_raw)
+            pg_stat = _strip_latency_histogram_column(pg_stat_raw)
             with stage_timer("ycql_stat_statements_top", _log, node_id=nid) as st:
                 ycql = _serialize_rows(Q.ycql_stat_statements_top(conn, statements_per_node))
                 st.row_count = len(ycql)
@@ -135,7 +224,14 @@ def _collect_one_node(
             with stage_timer("yb_local_tablets_rows", _log, node_id=nid) as st:
                 tablets = _serialize_rows(Q.yb_local_tablets_rows(conn))
                 st.row_count = len(tablets)
-    return _NodeCollectResult(nid=nid, pg_stat=pg_stat, ycql=ycql, ash=ash, tablets=tablets)
+    return _NodeCollectResult(
+        nid=nid,
+        pg_stat=pg_stat,
+        ycql=ycql,
+        ash=ash,
+        tablets=tablets,
+        latency_histograms=latency_histograms,
+    )
 
 
 def _collect_nodes_parallel(
@@ -148,8 +244,10 @@ def _collect_nodes_parallel(
     ash_window_sec: float,
     statements_per_node: int,
     ash_per_node: int,
+    collect_latency_histograms: bool,
     node_parallelism: int,
 ) -> tuple[
+    dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
@@ -159,6 +257,7 @@ def _collect_nodes_parallel(
     ycql_out: dict[str, list[dict[str, Any]]] = {}
     ash_out: dict[str, list[dict[str, Any]]] = {}
     tablets_out: dict[str, list[dict[str, Any]]] = {}
+    histograms_out: dict[str, list[dict[str, Any]]] = {}
     workers = min(max(1, int(node_parallelism)), len(nodes))
     node_count = len(nodes)
     collect_kw = {
@@ -170,6 +269,7 @@ def _collect_nodes_parallel(
         "ash_window_sec": ash_window_sec,
         "statements_per_node": statements_per_node,
         "ash_per_node": ash_per_node,
+        "collect_latency_histograms": collect_latency_histograms,
     }
 
     def _run(node: YsqlNode) -> _NodeCollectResult:
@@ -200,7 +300,9 @@ def _collect_nodes_parallel(
         ycql_out[r.nid] = r.ycql
         ash_out[r.nid] = r.ash
         tablets_out[r.nid] = r.tablets
-    return statements_out, ycql_out, ash_out, tablets_out
+        if collect_latency_histograms:
+            histograms_out[r.nid] = r.latency_histograms
+    return statements_out, ycql_out, ash_out, tablets_out, histograms_out
 
 
 def _build_snapshot_document_impl(
@@ -213,6 +315,7 @@ def _build_snapshot_document_impl(
     ensure_ycql_extension: bool = False,
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
+    latency_histograms: bool = False,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     ash_window_sec = round((ash_end - ash_start).total_seconds(), 2)
@@ -241,18 +344,23 @@ def _build_snapshot_document_impl(
             with connect(seed_dsn) as conn:
                 Q.ensure_yb_ycql_utils_extension(conn)
 
-    statements_per_node_out, ycql_per_node_out, ash_per_node_out, tablets_per_node_out = (
-        _collect_nodes_parallel(
-            seed_dsn=seed_dsn,
-            nodes=nodes,
-            caps=caps,
-            ash_start=ash_start,
-            ash_end=ash_end,
-            ash_window_sec=ash_window_sec,
-            statements_per_node=statements_per_node,
-            ash_per_node=ash_per_node,
-            node_parallelism=node_parallelism,
-        )
+    (
+        statements_per_node_out,
+        ycql_per_node_out,
+        ash_per_node_out,
+        tablets_per_node_out,
+        latency_histograms_per_node_out,
+    ) = _collect_nodes_parallel(
+        seed_dsn=seed_dsn,
+        nodes=nodes,
+        caps=caps,
+        ash_start=ash_start,
+        ash_end=ash_end,
+        ash_window_sec=ash_window_sec,
+        statements_per_node=statements_per_node,
+        ash_per_node=ash_per_node,
+        collect_latency_histograms=latency_histograms,
+        node_parallelism=node_parallelism,
     )
 
     top_tables: list[dict[str, Any]] = []
@@ -305,6 +413,13 @@ def _build_snapshot_document_impl(
         }
     if table_schemas:
         doc["table_schemas"] = {"by_table_id": table_schemas}
+    if latency_histograms:
+        doc["latency_histograms"] = {
+            # Same top-N-by-total-time set as pg_stat_statements; empty histograms omitted.
+            "limit": statements_per_node,
+            "supported": bool(caps.pg_stat_latency_histogram),
+            "per_node": latency_histograms_per_node_out,
+        }
     return doc
 
 
@@ -428,6 +543,61 @@ def write_snapshot_and_update_manifest(
         return snap_path
 
 
+def latency_analysis_filename(snapshot_filename: str, *, compress: bool = False) -> str:
+    """Sidecar name for a snapshot: ``ybtop.out.<ts>.json`` -> ``ybtop.latency.<ts>.json``."""
+    base = snapshot_filename
+    for ext in (".json.gz", ".json"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    ts = base[len(SNAPSHOT_FILE_PREFIX):] if base.startswith(SNAPSHOT_FILE_PREFIX) else base
+    ext = ".json.gz" if compress else ".json"
+    return f"{LATENCY_ANALYSIS_FILE_PREFIX}{ts}{ext}"
+
+
+def write_latency_analysis_and_update_manifest(
+    *,
+    output_dir: Path,
+    snapshot_file: str,
+    artifact: dict[str, Any],
+    compress: bool = False,
+) -> Path:
+    """Write a precomputed latency-analysis sidecar and record it on the snapshot's manifest entry.
+
+    The manifest entry for ``snapshot_file`` gains a ``latency_analysis`` field pointing at the
+    sidecar so the viewer can load it without probing, and GC prunes the two together.
+    """
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_name = latency_analysis_filename(snapshot_file, compress=compress)
+    sidecar_path = output_dir / sidecar_name
+    _atomic_write_json(sidecar_path, artifact, compress=compress)
+
+    manifest_path = output_dir / MANIFEST_FILENAME
+    entries: list[dict[str, Any]] = []
+    if manifest_path.is_file():
+        try:
+            prev = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(prev, list):
+                entries = prev
+            elif isinstance(prev, dict) and isinstance(prev.get("entries"), list):
+                entries = list(prev["entries"])
+        except (json.JSONDecodeError, OSError):
+            entries = []
+    for e in entries:
+        if e.get("file") == snapshot_file:
+            e["latency_analysis"] = sidecar_name
+    _atomic_write_json(manifest_path, {"format_version": 1, "entries": entries})
+    log_event(
+        _log,
+        "latency_analysis_written",
+        snapshot_file=snapshot_file,
+        analysis_file=sidecar_name,
+        analysis_bytes=sidecar_path.stat().st_size,
+    )
+    return sidecar_path
+
+
 def gc_snapshots_and_manifest(
     *,
     output_dir: Path,
@@ -453,6 +623,8 @@ def gc_snapshots_and_manifest(
         for path in (
             glob.glob(str(output_dir / f"{SNAPSHOT_FILE_PREFIX}*.json"))
             + glob.glob(str(output_dir / f"{SNAPSHOT_FILE_PREFIX}*.json.gz"))
+            + glob.glob(str(output_dir / f"{LATENCY_ANALYSIS_FILE_PREFIX}*.json"))
+            + glob.glob(str(output_dir / f"{LATENCY_ANALYSIS_FILE_PREFIX}*.json.gz"))
         ):
             p = Path(path)
             mt = file_mtime_utc(p)

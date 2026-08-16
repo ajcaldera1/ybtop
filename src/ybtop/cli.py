@@ -71,6 +71,52 @@ def _watch_header_line(*, viewer_url: Optional[str], out_dir: Path) -> Text:
     return Text(f"ybtop watch: (data dir: {root})")
 
 
+_latency_analysis_deps_warned = False
+
+
+def _maybe_write_latency_analysis(
+    *, out_dir: Path, snapshot_file: str, doc: Any, settings: Settings, log: Any
+) -> None:
+    """Best-effort: precompute the dip-confirmed latency report sidecar for the fresh snapshot.
+
+    Never raises into the watch loop. Missing optional deps ([histogram] extra) are logged once;
+    a cluster without ``yb_latency_histogram`` data is silently skipped.
+    """
+    global _latency_analysis_deps_warned
+    from ybtop.histogram import has_latency_histogram_data
+
+    if not (isinstance(doc, dict) and has_latency_histogram_data(doc)):
+        return
+    try:
+        from ybtop.histogram_detect import HistogramDepsError
+        from ybtop.histogram_report import build_analysis_artifact
+        from ybtop.snapshot_write import write_latency_analysis_and_update_manifest
+
+        artifact = build_analysis_artifact(
+            str(out_dir),
+            index=None,  # latest = the snapshot just written
+            min_calls=30,
+            fdr_q=0.05,
+        )
+        write_latency_analysis_and_update_manifest(
+            output_dir=out_dir,
+            snapshot_file=snapshot_file,
+            artifact=artifact,
+            compress=settings.snapshot_compress,
+        )
+    except HistogramDepsError as exc:
+        if not _latency_analysis_deps_warned:
+            _latency_analysis_deps_warned = True
+            log_event(
+                log,
+                "latency_analysis_skipped",
+                level=logging.WARNING,
+                reason=str(exc),
+            )
+    except Exception as exc:  # noqa: BLE001 - analysis must never break the snapshot loop
+        log_event(log, "latency_analysis_error", level=logging.WARNING, error=str(exc))
+
+
 def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
     console = Console()
     out_dir = Path(settings.snapshot_output_dir)
@@ -113,9 +159,18 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                         ensure_ycql_extension=(iteration == 1),
                         ash_top_tables=settings.snapshot_ash_top_tables,
                     collect_table_ddl=settings.snapshot_collect_table_ddl,
+                    latency_histograms=settings.snapshot_latency_histograms,
                     node_parallelism=settings.node_parallelism,
                 )
-                    write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
+                    snap_path = write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
+                    if settings.snapshot_latency_analysis:
+                        _maybe_write_latency_analysis(
+                            out_dir=out_dir,
+                            snapshot_file=snap_path.name,
+                            doc=doc,
+                            settings=settings,
+                            log=watch_log,
+                        )
                     gc_snapshots_and_manifest(
                         output_dir=out_dir,
                         retention_hours=settings.snapshot_retention_hours,
@@ -348,6 +403,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     w.add_argument(
+        "--snapshot-latency-histograms",
+        action="store_true",
+        help=(
+            "Collect per-statement yb_latency_histogram values into each snapshot (opt-in; "
+            "enables the viewer's Latency modes tab, and dip-confirmed sidecars when "
+            "--snapshot-latency-analysis is also set). "
+            "Pulled with the existing top-N-by-total-time pg_stat_statements query "
+            "(--snapshot-statements-per-node); NULL histograms coalesce to empty jsonb and "
+            "are omitted from the latency_histograms section. No-op on clusters without the "
+            "yb_latency_histogram column."
+        ),
+    )
+    w.add_argument(
+        "--snapshot-latency-analysis",
+        action="store_true",
+        help=(
+            "Precompute the dip-confirmed latency-multimodality report (cumulative + delta) into "
+            "an ybtop.latency.*.json sidecar per snapshot, so the browser shows confirmed tiers "
+            "offline without shipping any statistics code. Implies --snapshot-latency-histograms; "
+            "best-effort (skipped with a log note if the [histogram] extra is not installed)."
+        ),
+    )
+    w.add_argument(
         "--compress-snapshots",
         action="store_true",
         help="Write snapshot files as gzip-compressed JSON (.json.gz) instead of plain JSON.",
@@ -489,6 +567,10 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
             getattr(args, "snapshot_ash_top_tables", SNAPSHOT_ASH_TOP_TABLES)
         ),
         snapshot_collect_table_ddl=bool(getattr(args, "snapshot_table_ddl", False)),
+        # --snapshot-latency-analysis needs the histograms in the snapshot, so it implies collection.
+        snapshot_latency_histograms=bool(getattr(args, "snapshot_latency_histograms", False))
+        or bool(getattr(args, "snapshot_latency_analysis", False)),
+        snapshot_latency_analysis=bool(getattr(args, "snapshot_latency_analysis", False)),
         snapshot_compress=bool(getattr(args, "compress_snapshots", False)),
         log_enabled=not bool(getattr(args, "no_log_file", False)),
         log_file=getattr(args, "log_file", None),
