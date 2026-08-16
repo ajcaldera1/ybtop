@@ -149,9 +149,10 @@
   let ashTableIdFilter = null;
 
   /**
-   * "Group by query template" toggles (per panel). When on, statements/ASH rows are collapsed by
-   * their normalized query template (IN-list arity and per-call comments ignored). Flipping a
-   * toggle re-renders from the retained snapshot, matching the ASH-filter navigation pattern.
+   * "Group by query template" toggles (per panel). When on, the panel's main table collapses to
+   * one row per normalized query template (IN-list arity, VALUES lists, and per-call comments
+   * ignored). Flipping a toggle re-renders from the retained snapshot, matching the ASH-filter
+   * navigation pattern.
    */
   let pgssGroupByTemplate = false;
   let ycqlGroupByTemplate = false;
@@ -4603,39 +4604,33 @@
         ashQueryTextLinks: true,
       };
       const ashPaginatedOpts = { ashCellOpts: ashReportCellOpts };
-      const ashMainTop50GroupLabel = qF
-        ? "Table/Index + Wait_Event"
-        : tableF
-        ? "Query + Wait_Event"
-        : "Table/Index + Query + Wait_Event";
-      panelAsh.appendChild(
-        buildSortablePaginatedTable(
-          `Top 50 Active Sessions/sec Grouped By: ${ashMainTop50GroupLabel}`,
-          mergedAshL,
-          ashMainCols,
-          50,
-          "sec-ash-main",
-          undefined,
-          ashPaginatedOpts
-        )
-      );
+      // Sort columns (Active Sessions/sec, Load %) stay on the left; the `queries` count sits to
+      // the right of the query text, matching the ASH panel's original by-query layout/sort.
+      const ashTemplateCols = [
+        ASH_SPS_COL,
+        ASH_LOAD_COL,
+        { key: "query", label: "query" },
+        { key: "members", label: "queries", type: "number", align: "right" },
+        { key: "query_id", label: "query_id" },
+      ];
 
       // Query-template grouping for ASH samples. Meaningless when already scoped to one query id.
+      // When on, replace the Top 50 main table (same swap pattern as pgss / ycql) — do not append
+      // a second grouped table beneath it.
+      const byTemplateL = !qF ? ashEnriched(groupAshByTemplate(mergedAsh)) : [];
       if (!qF) {
-        // Sort columns (Active Sessions/sec, Load %) stay on the left; the `queries` count sits to
-        // the right of the query text, matching the ASH panel's original by-query layout/sort.
-        const ashTemplateCols = [
-          ASH_SPS_COL,
-          ASH_LOAD_COL,
-          { key: "query", label: "query" },
-          { key: "members", label: "queries", type: "number", align: "right" },
-          { key: "query_id", label: "query_id" },
-        ];
-        const byTemplateL = ashEnriched(groupAshByTemplate(mergedAsh));
         panelAsh.appendChild(
           buildGroupByTemplateControl(ashGroupByTemplate, (v) => {
             ashGroupByTemplate = v;
             if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+          })
+        );
+        panelAsh.appendChild(
+          el("div", {
+            className: "pgss-activity-note",
+            textContent: ashGroupByTemplate
+              ? "Grouping by query template replaces the Top 50 dimensional breakdown (table/index + query + wait event) with one row per normalized query — wait-event and object dimensions are rolled into each template. Turn the toggle off to restore that breakdown."
+              : "Group by query template replaces the Top 50 wait-event breakdown with a query-only rollup (one row per template, summing Active Sessions across wait events and objects). The Recurring query templates summary is always shown when multiple query_ids share a template.",
           })
         );
         const ashTemplateSummary = byTemplateL.filter((r) => (Number(r.members) || 1) > 1);
@@ -4650,17 +4645,43 @@
             )
           );
         }
-        if (ashGroupByTemplate) {
-          panelAsh.appendChild(
-            buildSortableTable(
-              `Active Sessions/Sec Grouped By: Query Template (${byTemplateL.length} groups)`,
-              byTemplateL,
-              ashTemplateCols,
-              "sec-ash-by-template",
-              ashReportCellOpts
-            )
-          );
+      }
+
+      if (!qF && ashGroupByTemplate) {
+        panelAsh.appendChild(
+          buildSortablePaginatedTable(
+            "Top 50 Active Sessions/sec Grouped By: Query Template",
+            byTemplateL,
+            ashTemplateCols,
+            50,
+            "sec-ash-main",
+            undefined,
+            ashPaginatedOpts
+          )
+        );
+      } else {
+        const ashMainTop50GroupLabel = qF
+          ? "Table/Index + Wait_Event"
+          : tableF
+          ? "Query + Wait_Event"
+          : "Table/Index + Query + Wait_Event";
+        let ashMainRows = mergedAshL;
+        let ashMainDisplayCols = ashMainCols;
+        if (!qF) {
+          tagRowsWithTemplate(ashMainRows, "samples");
+          ashMainDisplayCols = withTmplColumn(ashMainCols);
         }
+        panelAsh.appendChild(
+          buildSortablePaginatedTable(
+            `Top 50 Active Sessions/sec Grouped By: ${ashMainTop50GroupLabel}`,
+            ashMainRows,
+            ashMainDisplayCols,
+            50,
+            "sec-ash-main",
+            undefined,
+            ashPaginatedOpts
+          )
+        );
       }
 
       if (tableF) {
