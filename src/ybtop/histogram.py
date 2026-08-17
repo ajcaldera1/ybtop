@@ -270,7 +270,9 @@ def apply_bh_correction(results: list[dict[str, Any]], q: float = 0.05) -> dict[
     return {"m": m, "q": q, "downgraded": downgraded}
 
 
-_REWRITE_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
+# Strip /* ... */ comments except planner hints (pg_hint_plan / YSQL /*+ ... */), which can
+# change the chosen plan and must keep templates distinct.
+_REWRITE_COMMENT_RE = re.compile(r"/\*(?!\+).*?\*/", re.S)
 # Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
 _IN_LIST_RE = re.compile(r"\bIN\s*\((?!\s*SELECT\b)[^)]*\)", re.I)
 # A VALUES row-list (one or more parenthesized rows, each allowing one level of nested parens for
@@ -287,7 +289,9 @@ _WS_RE = re.compile(r"\s+")
 def normalize_query_template(query: Optional[str]) -> str:
     """Collapse a query into a template that ignores per-call comments, IN-list, and VALUES arity.
 
-    1. Strip embedded per-call comments (e.g. ``/*rewritten_pid='123'*/``).
+    1. Strip embedded per-call comments (e.g. ``/*rewritten_pid='123'*/``). Planner hints
+       that start with ``/*+`` (pg_hint_plan / YSQL) are preserved so distinct hint sets stay
+       distinct templates.
     2. Collapse a value-list ``IN (...)`` (literals or ``$N``) to a canonical ``IN (...)``;
        a subquery ``IN (SELECT ...)`` is left untouched.
     3. Collapse a ``VALUES (...),(...),...`` row-list (any number of rows) to a canonical

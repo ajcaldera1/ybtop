@@ -10,7 +10,7 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 
 ### Changed
 
-- **Query-template normalization (CLI + viewer):** `normalize_query_template` (and its byte-identical browser twin) now also collapses a bulk **`VALUES (...),(...),…`** row-list — any number of rows, one level of nested parens allowed per row for casts/function calls — to a canonical **`VALUES (...)`**. This folds multi-row upserts/bulk updates such as `UPDATE t AS x SET … FROM (VALUES (...)) WHERE …` into a single template regardless of row count, affecting Latency-modes template grouping and the new statement/ASH panel grouping.
+- **Query-template normalization (CLI + viewer):** `normalize_query_template` (and its byte-identical browser twin) now also collapses a bulk **`VALUES (...),(...),…`** row-list — any number of rows, one level of nested parens allowed per row for casts/function calls — to a canonical **`VALUES (...)`**. This folds multi-row upserts/bulk updates such as `UPDATE t AS x SET … FROM (VALUES (...)) WHERE …` into a single template regardless of row count, affecting Latency-modes template grouping and the new statement/ASH panel grouping. Per-call `/* … */` comments are still stripped, but planner hints that start with **`/*+`** are preserved so distinct hint sets stay distinct templates. See **Query normalization** in the README for the full step list and before/after examples.
 - **`IN (...)` normalization now skips subqueries:** only a **value-list** `IN (...)` (literals / `$N`) is collapsed; a subquery **`IN (SELECT …)`** (e.g. `DELETE FROM t WHERE c IN (SELECT c FROM t WHERE …)`) is left intact so semantically distinct subquery predicates no longer fold into the same template.
 
 ## [0.1.12] — 2026-08-11

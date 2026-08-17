@@ -3606,7 +3606,10 @@
     return ordered;
   }
 
-  const HIST_REWRITE_COMMENT_RE = /\/\*[\s\S]*?\*\//g;
+  // Strip /* ... */ comments except planner hints (pg_hint_plan / YSQL /*+ ... */), which can
+  // change the chosen plan and must keep templates distinct. Kept identical to Python
+  // _REWRITE_COMMENT_RE.
+  const HIST_REWRITE_COMMENT_RE = /\/\*(?!\+)[\s\S]*?\*\//g;
   // Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
   const HIST_IN_LIST_RE = /\bIN\s*\((?!\s*SELECT\b)[^)]*\)/gi;
   // Bulk VALUES row-list — collapse `VALUES (...),(...),...` (any row count, one level of nested
