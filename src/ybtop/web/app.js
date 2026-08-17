@@ -3719,11 +3719,13 @@
     const groups = new Map();
     (mergedRows || []).forEach((r) => {
       const key = queryTemplateKey(r.query);
+      if (!key) return;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
     });
     const out = [];
     groups.forEach((members, key) => {
+      if (!key) return;
       let calls = 0;
       let exec = 0;
       let rows = 0;
