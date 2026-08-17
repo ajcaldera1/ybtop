@@ -4182,12 +4182,15 @@
         calls: r.calls,
         rank: i + 1,
       })).filter((m) => m.query_id);
+      // best_confidence_rank comes from rankByConfidence over the full analyzed set (caller
+      // stamps it before grouping); do not fall back to 0 — that sorted as missing (1e9).
+      const bestRank = best.confidence_rank;
       summaries.push({
         query_template: key,
         template: key,
         member_count: members.length,
         members: queryMembers.length || members.length,
-        best_confidence_rank: best.confidence_rank || 0,
+        best_confidence_rank: bestRank != null && bestRank !== "" ? Number(bestRank) : 1e9,
         best_confidence_tier: best.confidence_tier || "not_flagged",
         queryids: queryMembers.map((m) => m.query_id),
         query_members: queryMembers,
@@ -4198,9 +4201,7 @@
         gap_ratio_range: gapRatio.length ? [Math.min(...gapRatio), Math.max(...gapRatio)] : null,
       });
     });
-    summaries.sort(
-      (a, b) => (a.best_confidence_rank || 1e9) - (b.best_confidence_rank || 1e9)
-    );
+    summaries.sort((a, b) => a.best_confidence_rank - b.best_confidence_rank);
     return summaries;
   }
 
@@ -4412,6 +4413,12 @@
     panel.appendChild(tableHolder);
 
     function rerender() {
+      // Stamp confidence_rank on every analyzed statement first so template "best" ranks stay
+      // stable when tier / flagged-only filters hide some members. The filtered table below is
+      // re-ranked among the visible rows only.
+      rankByConfidence(analysis.results);
+      const groups = groupByTemplate(analysis.results);
+
       let rows = analysis.results.slice();
       if (state.flaggedOnly) rows = rows.filter((r) => r.flag);
       if (state.minTier !== "all") {
@@ -4419,9 +4426,6 @@
         rows = rows.filter((r) => (HIST_TIER_RANK[r.confidence_tier] || 0) >= th);
       }
       rows = rankByConfidence(rows);
-      // Template membership comes from every analyzed statement, not just the filtered rows, so a
-      // family keeps its identity (and rank/count) when filters hide some of its members.
-      const groups = groupByTemplate(analysis.results);
       const shownTemplates = new Set(
         rows.map((r) => r.query_template || queryTemplateKey(r.query)).filter(Boolean)
       );
