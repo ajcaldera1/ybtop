@@ -897,6 +897,27 @@ tr:nth-child(even) {
   cursor: pointer;
 }
 
+.tmpl-group-control--disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.tmpl-group-control--disabled input {
+  cursor: not-allowed;
+}
+
+.tmpl-merge-block {
+  margin: 0 0 0.75rem;
+}
+
+.tmpl-merge-block .tmpl-group-control {
+  margin-bottom: 0.35rem;
+}
+
+.tmpl-merge-block .pgss-activity-note {
+  margin-top: 0;
+}
+
 .tmpl-member-list {
   display: grid;
   gap: 0.2rem;

@@ -149,14 +149,18 @@
   let ashTableIdFilter = null;
 
   /**
-   * "Group by query template" toggles (per panel). When on, the panel's main table collapses to
-   * one row per normalized query template (IN-list arity, VALUES lists, and per-call comments
-   * ignored). Flipping a toggle re-renders from the retained snapshot, matching the ASH-filter
-   * navigation pattern.
+   * "Group by query template" toggles (statement panels). When on, the panel's main table
+   * collapses to one row per query template (see mergeSimilarSql for whether IN/VALUES/$N are
+   * collapsed first). Flipping a toggle re-renders from the retained snapshot.
    */
   let pgssGroupByTemplate = false;
   let ycqlGroupByTemplate = false;
-  let ashGroupByTemplate = false;
+  /**
+   * Viewer-wide: when true, query templates collapse IN-list arity, VALUES row-lists, $N binds,
+   * and per-call comments via normalizeQueryTemplate. When false, each distinct SQL string is its
+   * own template key (whitespace trimmed only).
+   */
+  let mergeSimilarSql = true;
   /** Latency modes tab: include the dip_p column when true (browser-only UI preference). */
   let latencyShowDipP = true;
 
@@ -3621,9 +3625,19 @@
     return q;
   }
 
+  /** Template identity for viewer grouping — full normalize when Merge similar SQL is on. */
+  function queryTemplateKey(query) {
+    if (!mergeSimilarSql) {
+      if (!query) return "";
+      return String(query).replace(/\s+/g, " ").trim();
+    }
+    return normalizeQueryTemplate(query);
+  }
+
   // --- Shared query-template grouping for the statement/ASH panels ------------------------------
-  // These reuse normalizeQueryTemplate (kept byte-identical to the Python normalize_query_template
-  // in src/ybtop/histogram.py) so a template collapses the same way in every panel and in the CLI.
+  // These reuse queryTemplateKey (normalizeQueryTemplate when Merge similar SQL is on; kept
+  // byte-identical to Python normalize_query_template) so a template collapses the same way in
+  // every panel and in the CLI when merging is enabled.
 
   /**
    * Tag each display row in place with query_template / template_rank / template_member_count and a
@@ -3650,7 +3664,7 @@
       (rows || []).forEach((r) => {
         r.tmpl = "";
         r.template_label = "";
-        const key = normalizeQueryTemplate(r.query);
+        const key = queryTemplateKey(r.query);
         r.query_template = key;
         const qid =
           r.queryid != null && r.queryid !== undefined
@@ -3670,7 +3684,7 @@
     }
     const groups = new Map();
     (rows || []).forEach((r) => {
-      const key = normalizeQueryTemplate(r.query);
+      const key = queryTemplateKey(r.query);
       r.query_template = key;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
@@ -3704,7 +3718,7 @@
     );
     const groups = new Map();
     (mergedRows || []).forEach((r) => {
-      const key = normalizeQueryTemplate(r.query);
+      const key = queryTemplateKey(r.query);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
     });
@@ -3762,7 +3776,7 @@
   function statementTemplateSummaryRows(rows) {
     const groups = new Map();
     (rows || []).forEach((r) => {
-      const key = normalizeQueryTemplate(r.query);
+      const key = queryTemplateKey(r.query);
       if (!key) return;
       if (!groups.has(key)) {
         groups.set(key, {
@@ -3835,39 +3849,33 @@
     ];
   }
 
-  function statementTemplateLegendNote(groupByOn) {
-    return (
-      "Template legend — template id is PRIMARY_TABLE_SQLVERB_VARIANT, derived from normalized SQL (a numeric suffix disambiguates collisions). Member queryids are ranked by total time within the template; hover an id for its captured SQL (click opens query-scoped ASH). In the main table, tmpl shows “template-id rank/count” and stays blank without a recurring-template match. " +
-      (groupByOn
-        ? "The toggle is on: the main table is one row per template; turn it off to restore per-statement rows."
-        : "The toggle is off: turn it on to collapse the main table to one row per template.")
-    );
-  }
-
   /** Sort of the "Recurring query templates" tables — mirrors the statement panel (total time desc). */
   const STATEMENT_TEMPLATE_SUMMARY_SORT = { key: "total_ms", dir: "desc" };
 
-  /** Insert a `tmpl` column just after the `query` column (ungrouped statement tables). */
+  /** Main-table column showing recurring-template membership as `LABEL rank/count`. */
+  const TEMPLATE_ID_COLUMN_LABEL = "template_id rank/count";
+
+  /** Insert the template-id column just after the `query` column (ungrouped statement tables). */
   function withTmplColumn(baseCols) {
     const cols = [];
     let inserted = false;
     (baseCols || []).forEach((c) => {
       cols.push(c);
       if (!inserted && c.key === "query") {
-        cols.push({ key: "tmpl", label: "tmpl" });
+        cols.push({ key: "tmpl", label: TEMPLATE_ID_COLUMN_LABEL });
         inserted = true;
       }
     });
-    if (!inserted) cols.push({ key: "tmpl", label: "tmpl" });
+    if (!inserted) cols.push({ key: "tmpl", label: TEMPLATE_ID_COLUMN_LABEL });
     return cols;
   }
 
   /**
-   * ASH Top 50: place `tmpl` immediately after Load Distribution % when that column is present;
-   * otherwise after Load % so the template rank stays with the left-side metric columns.
+   * ASH Top 50: place the template-id column immediately after Load Distribution % when that
+   * column is present; otherwise after Load % so it stays with the left-side metric columns.
    */
   function withAshTmplColumn(baseCols) {
-    const tmplCol = { key: "tmpl", label: "tmpl" };
+    const tmplCol = { key: "tmpl", label: TEMPLATE_ID_COLUMN_LABEL };
     const cols = (baseCols || []).slice();
     const loadDistIdx = cols.findIndex((c) => c.key === "ash_node_load_distribution");
     if (loadDistIdx >= 0) {
@@ -3883,13 +3891,17 @@
     return cols;
   }
 
-  /** Columns for a template-collapsed statement table: drop per-statement id/db, add a count
-   *  immediately to the right of the query text (sort/metric columns stay on the left). */
+  /** Columns for a template-collapsed statement table: drop per-statement id/db, add the semantic
+   *  template id ahead of the query text and a member count right after it (mirrors the
+   *  "Recurring query templates" layout; sort/metric columns stay on the left). */
   function groupedStatementColumns(baseCols) {
     const cols = [];
     let inserted = false;
     (baseCols || []).forEach((c) => {
       if (c.key === "queryid" || c.key === "dbname" || c.key === "tmpl") return;
+      if (!inserted && c.key === "query") {
+        cols.push({ key: "template_label", label: "template id" });
+      }
       cols.push(c);
       if (!inserted && c.key === "query") {
         cols.push({ key: "_tmpl_member_count", label: "queries", type: "number", align: "right" });
@@ -3897,6 +3909,7 @@
       }
     });
     if (!inserted) {
+      cols.push({ key: "template_label", label: "template id" });
       cols.push({ key: "_tmpl_member_count", label: "queries", type: "number", align: "right" });
     }
     return cols;
@@ -3907,7 +3920,7 @@
     const m = new Map();
     (rows || []).forEach((r) => {
       const q = r.query != null && r.query !== undefined ? String(r.query) : "";
-      const key = normalizeQueryTemplate(q) || "\0__no_query__";
+      const key = queryTemplateKey(q) || "\0__no_query__";
       if (!m.has(key)) {
         m.set(key, {
           query_template: key === "\0__no_query__" ? "" : key,
@@ -3991,12 +4004,16 @@
 
   /**
    * Assign semantic IDs to template rows. If two normalized templates produce the same semantic
-   * base, append a deterministic ordinal after sorting by full template text.
+   * base, append a deterministic ordinal after sorting by full template text. Rows with no
+   * resolvable SQL keep template_label "N/A" so grouped tables never show a blank/missing id.
    */
   function labelAshTemplates(rows) {
     const byBase = new Map();
     (rows || []).forEach((r) => {
-      if (!r.query_template) return;
+      if (!r.query_template) {
+        r.template_label = "N/A";
+        return;
+      }
       const base = ashTemplateLabelBase(r.query_template);
       if (!byBase.has(base)) byBase.set(base, []);
       byBase.get(base).push(r);
@@ -4006,6 +4023,26 @@
       siblings.forEach((r, i) => {
         r.template_label = siblings.length > 1 ? `${base}_${i + 1}` : base;
       });
+    });
+    return rows;
+  }
+
+  /**
+   * Label template-collapsed statement rows (queryid is the template text) from the "Recurring
+   * query templates" catalog, so a template reads the same id in both tables. Singletons and rows
+   * with no resolvable template stay blank — an id only means something once it is shared.
+   */
+  function labelCollapsedTemplateRows(rows, catalogRows) {
+    const known = new Map();
+    (catalogRows || []).forEach((t) => {
+      if (t.query_template && t.template_label && t.members > 1) {
+        known.set(t.query_template, t.template_label);
+      }
+    });
+    (rows || []).forEach((r) => {
+      const key = r.queryid != null && r.queryid !== undefined ? String(r.queryid) : "";
+      r.query_template = key;
+      r.template_label = (key && known.get(key)) || "";
     });
     return rows;
   }
@@ -4033,7 +4070,7 @@
       r.tmpl = "";
       r.template_label = "";
       const q = r.query != null && r.query !== undefined ? String(r.query) : "";
-      const key = normalizeQueryTemplate(q);
+      const key = queryTemplateKey(q);
       const qid =
         r.query_id != null && r.query_id !== undefined ? String(r.query_id).trim() : "";
       const template = key ? catalog.get(key) : null;
@@ -4045,20 +4082,56 @@
   }
 
   /** Small reusable "Group by query template" checkbox control. */
-  function buildGroupByTemplateControl(checked, onChange) {
-    const wrap = el("label", { className: "tmpl-group-control" });
+  function buildGroupByTemplateControl(checked, onChange, opts) {
+    const options = opts || {};
+    const disabled = !!options.disabled;
+    const wrap = el("label", {
+      className: "tmpl-group-control" + (disabled ? " tmpl-group-control--disabled" : ""),
+    });
     const chk = el("input", { type: "checkbox" });
-    chk.checked = !!checked;
+    chk.checked = !!checked && !disabled;
+    chk.disabled = disabled;
+    if (disabled) {
+      wrap.title = "Turn on Merge similar SQL to group by query template.";
+    }
     chk.addEventListener("change", () => onChange(chk.checked));
     wrap.appendChild(chk);
     wrap.appendChild(el("span", { textContent: "Group by query template" }));
     return wrap;
   }
 
+  /** Viewer-wide Merge similar SQL toggle + one-line explainer. */
+  function buildMergeSimilarSqlControl() {
+    const block = el("div", { className: "tmpl-merge-block" });
+    const wrap = el("label", { className: "tmpl-group-control" });
+    const chk = el("input", { type: "checkbox" });
+    chk.checked = !!mergeSimilarSql;
+    chk.addEventListener("change", () => {
+      mergeSimilarSql = chk.checked;
+      if (!mergeSimilarSql) {
+        // Group-by-template only makes sense once similar SQL has been collapsed into templates.
+        pgssGroupByTemplate = false;
+        ycqlGroupByTemplate = false;
+      }
+      if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+    });
+    wrap.appendChild(chk);
+    wrap.appendChild(el("span", { textContent: "Merge similar SQL" }));
+    block.appendChild(wrap);
+    block.appendChild(
+      el("div", {
+        className: "pgss-activity-note",
+        textContent:
+          "When on, IN-lists, VALUES lists and bind position variables are collapsed so recurring shapes share one template id. That template id is PRIMARY_TABLE_SQLVERB_VARIANT, derived from normalized SQL (a numeric suffix disambiguates collisions). Blank for singletons and rows with no resolvable template.",
+      })
+    );
+    return block;
+  }
+
   function groupByTemplate(results) {
     const groups = new Map();
     results.forEach((r) => {
-      const key = normalizeQueryTemplate(r.query);
+      const key = queryTemplateKey(r.query);
       r.query_template = key;
       if (!key) return;
       if (!groups.has(key)) groups.set(key, []);
@@ -4261,6 +4334,7 @@
     dipWrap.appendChild(el("span", { textContent: "show dip_p" }));
     controls.appendChild(dipWrap);
     panel.appendChild(controls);
+    panel.appendChild(buildMergeSimilarSqlControl());
 
     const legend = el("div", { className: "latency-legend" });
     legend.appendChild(
@@ -4269,7 +4343,7 @@
         textContent: "Reading the columns",
       })
     );
-    [
+    const legendRows = [
       [
         "bc",
         "Bimodality coefficient (Sarle): (skew\u00b2 + 1) / kurtosis over log\u2082 latency midpoints. " +
@@ -4304,22 +4378,18 @@
           "10\u2013100\u00d7 gap looks more like retries, leader/follower reads, or cross-AZ hops). " +
           "This is distinct from spread (overall min\u2013max range).",
       ],
-      [
-        "template id",
-        "PRIMARY_TABLE_SQLVERB_VARIANT from the normalized query template (a numeric suffix " +
-          "disambiguates collisions). Recurring query templates lists every member queryid " +
-          "ranked by confidence within that template; hover an id for SQL, click to open " +
-          "query-scoped ASH.",
-      ],
-      [
-        "tmpl",
+    ];
+    if (mergeSimilarSql) {
+      legendRows.push([
+        "template_id rank/count",
         "Shows “template-id rank/count” when the row’s queryid belongs to a recurring template " +
           "(2+ distinct queryids). Rank 1 is the best-confidence member. Membership covers every " +
           "analyzed statement, so rank/count stay the same as you change the tier and flagged-only " +
           "filters — a template is listed whenever at least one of its members is on screen. " +
           "Blank for singletons and rows with no resolvable template.",
-      ],
-    ].forEach(([k, v]) => {
+      ]);
+    }
+    legendRows.forEach(([k, v]) => {
       const row = el("div", { className: "latency-legend-row" });
       row.appendChild(el("code", { className: "latency-legend-key", textContent: k }));
       row.appendChild(el("span", { className: "latency-legend-val", textContent: v }));
@@ -4344,16 +4414,20 @@
       // family keeps its identity (and rank/count) when filters hide some of its members.
       const groups = groupByTemplate(analysis.results);
       const shownTemplates = new Set(
-        rows.map((r) => r.query_template || normalizeQueryTemplate(r.query)).filter(Boolean)
+        rows.map((r) => r.query_template || queryTemplateKey(r.query)).filter(Boolean)
       );
-      const recurring = labelAshTemplates(
-        groups.filter(
-          (g) =>
-            (g.member_count || g.members || 0) > 1 &&
-            g.query_template &&
-            shownTemplates.has(g.query_template)
-        )
-      );
+      // Without Merge similar SQL a "template" is just the exact SQL text, so the template
+      // apparatus (recurring rollup, ids, tmpl) is suppressed rather than shown as singletons.
+      const recurring = mergeSimilarSql
+        ? labelAshTemplates(
+            groups.filter(
+              (g) =>
+                (g.member_count || g.members || 0) > 1 &&
+                g.query_template &&
+                shownTemplates.has(g.query_template)
+            )
+          )
+        : [];
       const catalog = new Map();
       recurring.forEach((template) => {
         if (!template.template_label) return;
@@ -4369,11 +4443,11 @@
       });
 
       const displayRows = rows.map((r) => {
-        const key = r.query_template || normalizeQueryTemplate(r.query);
+        const key = r.query_template || queryTemplateKey(r.query);
         const qid = r.queryid != null && r.queryid !== undefined ? String(r.queryid).trim() : "";
-        const template = key ? catalog.get(key) : null;
+        const template = mergeSimilarSql && key ? catalog.get(key) : null;
         const rank = template && qid ? template.ranks.get(qid) : null;
-        return {
+        const row = {
           tier: r.confidence_tier,
           rank: r.confidence_rank,
           calls: r.calls,
@@ -4382,10 +4456,13 @@
           peaks: r.n_raw_peaks,
           spread: histSpreadStr(r),
           gap: histGapStr(r),
-          tmpl: rank ? `${template.label} ${rank}/${template.count}` : "",
           queryid: r.queryid,
           query: r.query,
         };
+        if (mergeSimilarSql) {
+          row.tmpl = rank ? `${template.label} ${rank}/${template.count}` : "";
+        }
+        return row;
       });
       const cols = [
         { key: "tier", label: "tier", type: "number", sortValue: (r) => HIST_TIER_RANK[r.tier] || 0 },
@@ -4399,11 +4476,12 @@
       cols.push(
         { key: "peaks", label: "peaks", type: "number", align: "right" },
         { key: "spread", label: "spread" },
-        { key: "gap", label: "gap" },
-        { key: "tmpl", label: "tmpl" },
-        { key: "queryid", label: "queryid" },
-        { key: "query", label: "query" }
+        { key: "gap", label: "gap" }
       );
+      if (mergeSimilarSql) {
+        cols.push({ key: "tmpl", label: TEMPLATE_ID_COLUMN_LABEL });
+      }
+      cols.push({ key: "queryid", label: "queryid" }, { key: "query", label: "query" });
       tableHolder.textContent = "";
       const total = analysis.results.length;
       const flaggedN = analysis.results.filter((r) => r.flag).length;
@@ -4525,7 +4603,7 @@
       const merged = mergeStatements(st);
       const prevSt = prevDoc && prevDoc.pg_stat_statements && prevDoc.pg_stat_statements.per_node;
       const isDelta = !!(prevDoc && prevSt);
-      const grouped = pgssGroupByTemplate;
+      const grouped = mergeSimilarSql && pgssGroupByTemplate;
       const pgSort = { key: "total_ms", dir: "desc" };
 
       if (isDelta) {
@@ -4557,20 +4635,19 @@
         baseRows = withPgStatTimePercent(merged);
       }
 
+      panelPgss.appendChild(buildMergeSimilarSqlControl());
       panelPgss.appendChild(
-        buildGroupByTemplateControl(grouped, (v) => {
-          pgssGroupByTemplate = v;
-          if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
-        })
-      );
-      panelPgss.appendChild(
-        el("div", {
-          className: "pgss-activity-note",
-          textContent: statementTemplateLegendNote(grouped),
-        })
+        buildGroupByTemplateControl(
+          grouped,
+          (v) => {
+            pgssGroupByTemplate = v;
+            if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+          },
+          { disabled: !mergeSimilarSql }
+        )
       );
 
-      const pgSummary = statementTemplateSummaryRows(baseRows);
+      const pgSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
       if (pgSummary.length) {
         panelPgss.appendChild(
           buildSortableTable(
@@ -4602,19 +4679,24 @@
           pgRows.forEach((r) => {
             r._tmpl_member_count = memberByKey.get(String(r.queryid)) || 1;
           });
+          labelCollapsedTemplateRows(pgRows, pgSummary);
           pgCols = groupedStatementColumns(pgStatStatementColumnsDelta(pgRows, st));
           pgTitle = "pg_stat_statements by template (Δ vs prior snapshot)";
         } else {
           pgRows = withPgStatTimePercent(collapseStatementsByTemplate(merged));
+          labelCollapsedTemplateRows(pgRows, pgSummary);
           pgCols = groupedStatementColumns(pgStatStatementColumns(pgRows, st));
           pgTitle = "pg_stat_statements by template";
         }
       } else {
         pgRows = baseRows;
-        tagRowsWithTemplate(pgRows, "total_ms", pgSummary);
-        pgCols = withTmplColumn(
-          isDelta ? pgStatStatementColumnsDelta(pgRows, st) : pgStatStatementColumns(pgRows, st)
-        );
+        const pgBaseCols = isDelta
+          ? pgStatStatementColumnsDelta(pgRows, st)
+          : pgStatStatementColumns(pgRows, st);
+        if (mergeSimilarSql) {
+          tagRowsWithTemplate(pgRows, "total_ms", pgSummary);
+        }
+        pgCols = mergeSimilarSql ? withTmplColumn(pgBaseCols) : pgBaseCols;
         pgTitle = isDelta
           ? "Top 25 — pg_stat_statements (Δ vs prior snapshot)"
           : "Top 25 — pg_stat_statements";
@@ -4640,7 +4722,7 @@
       const prevYcqlSt =
         prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
       const isDelta = !!(prevDoc && prevYcqlSt);
-      const grouped = ycqlGroupByTemplate;
+      const grouped = mergeSimilarSql && ycqlGroupByTemplate;
       const ycqlSort = { key: "total_ms", dir: "desc" };
 
       if (isDelta) {
@@ -4677,22 +4759,28 @@
         baseRows = withPgStatTimePercent(mergedYcql);
       }
 
+      panelYcql.appendChild(buildMergeSimilarSqlControl());
       panelYcql.appendChild(
-        buildGroupByTemplateControl(grouped, (v) => {
-          ycqlGroupByTemplate = v;
-          if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
-        })
+        buildGroupByTemplateControl(
+          grouped,
+          (v) => {
+            ycqlGroupByTemplate = v;
+            if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+          },
+          { disabled: !mergeSimilarSql }
+        )
       );
-      panelYcql.appendChild(
-        el("div", {
-          className: "pgss-activity-note",
-          textContent:
-            "YCQL uses ? bind markers, so only IN (...) list arity is normalized when grouping templates. " +
-            statementTemplateLegendNote(grouped),
-        })
-      );
+      if (mergeSimilarSql) {
+        panelYcql.appendChild(
+          el("div", {
+            className: "pgss-activity-note",
+            textContent:
+              "YCQL uses ? bind markers, so only IN (...) list arity is normalized when grouping templates.",
+          })
+        );
+      }
 
-      const ycqlSummary = statementTemplateSummaryRows(baseRows);
+      const ycqlSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
       if (ycqlSummary.length) {
         panelYcql.appendChild(
           buildSortableTable(
@@ -4730,19 +4818,24 @@
           ycqlRows.forEach((r) => {
             r._tmpl_member_count = memberByKey.get(String(r.queryid)) || 1;
           });
+          labelCollapsedTemplateRows(ycqlRows, ycqlSummary);
           ycqlCols = groupedStatementColumns(ycqlStatStatementColumnsDelta());
           ycqlTitle = "ycql_stat_statements by template (Δ vs prior snapshot)";
         } else {
           ycqlRows = withPgStatTimePercent(collapseStatementsByTemplate(mergedYcql));
+          labelCollapsedTemplateRows(ycqlRows, ycqlSummary);
           ycqlCols = groupedStatementColumns(ycqlStatStatementColumns());
           ycqlTitle = "ycql_stat_statements by template";
         }
       } else {
         ycqlRows = baseRows;
-        tagRowsWithTemplate(ycqlRows, "total_ms", ycqlSummary);
-        ycqlCols = withTmplColumn(
-          isDelta ? ycqlStatStatementColumnsDelta() : ycqlStatStatementColumns()
-        );
+        const ycqlBaseCols = isDelta
+          ? ycqlStatStatementColumnsDelta()
+          : ycqlStatStatementColumns();
+        if (mergeSimilarSql) {
+          tagRowsWithTemplate(ycqlRows, "total_ms", ycqlSummary);
+        }
+        ycqlCols = mergeSimilarSql ? withTmplColumn(ycqlBaseCols) : ycqlBaseCols;
         ycqlTitle = isDelta
           ? "Top 25 — ycql_stat_statements (Δ vs prior snapshot)"
           : "Top 25 — ycql_stat_statements";
@@ -4948,33 +5041,18 @@
         { key: "query_members", label: "member query_ids (ranked)", sortable: false },
       ]);
 
-      // Query-template grouping for ASH samples. Meaningless when already scoped to one query id.
-      // When on, replace the Top 50 main table (same swap pattern as pgss / ycql) — do not append
-      // a second grouped table beneath it.
+      // Recurring query templates for ASH (template_id rank/count on query-bearing tables).
+      // No "Group by query template" swap here — the wait-event Top 50 stays the main table.
       const byTemplateL = !qF
         ? ashEnriched(labelAshTemplates(groupAshByTemplate(mergedAsh)))
         : [];
       if (!qF) {
-        panelAsh.appendChild(
-          buildGroupByTemplateControl(ashGroupByTemplate, (v) => {
-            ashGroupByTemplate = v;
-            if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
-          })
-        );
-        panelAsh.appendChild(
-          el("div", {
-            className: "pgss-activity-note",
-            textContent:
-              "Template legend — template id is PRIMARY_TABLE_SQLVERB_VARIANT, derived from normalized SQL (a numeric suffix disambiguates collisions). Member query_ids are ranked by total ASH samples across all wait events and objects; hover an id for its captured SQL. In the dimensional Top 50, tmpl shows “template-id rank/count” and stays blank without a recurring-template match. " +
-              (ashGroupByTemplate
-                ? "The toggle is on: the Top 50 is one row per template; turn it off to restore the table/index + query + wait-event breakdown."
-                : "The toggle is off: turn it on to replace the wait-event breakdown with one row per template."),
-          })
-        );
-        const ashTemplateSummary = byTemplateL.filter(
-          (r) =>
-            String(r.query_template || "").trim() !== "" && (Number(r.members) || 1) > 1
-        );
+        panelAsh.appendChild(buildMergeSimilarSqlControl());
+        const ashTemplateSummary = mergeSimilarSql
+          ? byTemplateL.filter(
+              (r) => String(r.query_template || "").trim() !== "" && (Number(r.members) || 1) > 1
+            )
+          : [];
         if (ashTemplateSummary.length) {
           panelAsh.appendChild(
             buildSortableTable(
@@ -4988,19 +5066,7 @@
         }
       }
 
-      if (!qF && ashGroupByTemplate) {
-        panelAsh.appendChild(
-          buildSortablePaginatedTable(
-            "Top 50 Active Sessions/sec Grouped By: Query Template",
-            byTemplateL,
-            ashTemplateCols,
-            50,
-            "sec-ash-main",
-            undefined,
-            ashPaginatedOpts
-          )
-        );
-      } else {
+      {
         const ashMainTop50GroupLabel = qF
           ? "Table/Index + Wait_Event"
           : tableF
@@ -5008,7 +5074,7 @@
           : "Table/Index + Query + Wait_Event";
         let ashMainRows = mergedAshL;
         let ashMainDisplayCols = ashMainCols;
-        if (!qF) {
+        if (!qF && mergeSimilarSql) {
           tagAshRowsWithRecurringTemplate(ashMainRows, byTemplateL);
           ashMainDisplayCols = withAshTmplColumn(ashMainCols);
         }
@@ -5075,8 +5141,13 @@
           ashShowNodeLoadDist
         );
         const byNsQueryTitle = `Active Sessions/Sec Grouped By: Database & Query (${byNsQueryL.length} groups)`;
+        let byNsQueryCols = byNsQueryColsAll;
+        if (mergeSimilarSql) {
+          tagAshRowsWithRecurringTemplate(byNsQueryL, byTemplateL);
+          byNsQueryCols = withAshTmplColumn(byNsQueryColsAll);
+        }
         panelAsh.appendChild(
-          buildSortableTable(byNsQueryTitle, byNsQueryL, byNsQueryColsAll, "sec-ash-ns-q", ashReportCellOpts)
+          buildSortableTable(byNsQueryTitle, byNsQueryL, byNsQueryCols, "sec-ash-ns-q", ashReportCellOpts)
         );
 
         let byNsObjBuckets = ashAggregateNsObjectBuckets(mergedAsh);
@@ -5134,9 +5205,13 @@
           ashClusterNodes,
           ashShowNodeLoadDist
         );
-        const byNsObjQueryCols = qF
+        let byNsObjQueryCols = qF
           ? ashColumnsWithoutQueryIdAndQuery(byNsObjQueryColsAll)
           : byNsObjQueryColsAll;
+        if (!qF && mergeSimilarSql) {
+          tagAshRowsWithRecurringTemplate(byNsObjQueryL, byTemplateL);
+          byNsObjQueryCols = withAshTmplColumn(byNsObjQueryCols);
+        }
         panelAsh.appendChild(
           buildSortableTable(
             byNsObjQueryTitle,
