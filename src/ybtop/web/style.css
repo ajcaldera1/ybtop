@@ -897,6 +897,30 @@ tr:nth-child(even) {
   cursor: pointer;
 }
 
+.tmpl-member-list {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 18rem;
+}
+
+.tmpl-member-row {
+  display: grid;
+  grid-template-columns: 2.2rem minmax(10rem, auto) auto;
+  gap: 0.4rem;
+  align-items: baseline;
+  white-space: nowrap;
+}
+
+.tmpl-member-rank {
+  color: var(--yb-muted);
+  text-align: right;
+}
+
+.tmpl-member-samples {
+  color: var(--yb-muted);
+  font-size: 0.78rem;
+}
+
 .err-banner {
   background: #3a1520;
   color: #ffc9c9;
