@@ -3975,7 +3975,11 @@
     return part || fallback;
   }
 
-  /** Human-readable, deterministic base label: PRIMARY_TABLE_SQLVERB_VARIANT. */
+  /**
+   * Human-readable, deterministic base label: PRIMARY_TABLE_SQLVERB, plus a shape suffix (IN,
+   * JOIN, ONCONFLICT_UPDATE, …) when the SQL has one. Plain statements carry no suffix, so a
+   * DELETE against res_relate reads RES_RELATE_DELETE (RES_RELATE_DELETE_1 once labels collide).
+   */
   function ashTemplateLabelBase(template) {
     const sql = String(template || "").trim();
     const verbMatch = sql.match(/\b(SELECT|INSERT|UPDATE|DELETE|MERGE)\b/i);
@@ -3989,7 +3993,7 @@
     else tableMatch = sql.match(new RegExp(`\\bFROM\\s+${ident}`, "i"));
     const table = ashTemplateLabelPart(tableMatch && tableMatch[1], "QUERY");
 
-    let variant = "BASE";
+    let variant = "";
     if (/\bON\s+CONFLICT\b[\s\S]*\bDO\s+NOTHING\b/i.test(sql)) variant = "ONCONFLICT_NOTHING";
     else if (/\bON\s+CONFLICT\b[\s\S]*\bDO\s+UPDATE\b/i.test(sql)) variant = "ONCONFLICT_UPDATE";
     else if (/\bUSING\s*\(\s*VALUES\b/i.test(sql)) variant = "USING_VALUES";
@@ -3999,7 +4003,7 @@
     else if (/\bJOIN\b/i.test(sql)) variant = "JOIN";
     else if (/\bUSING\b/i.test(sql)) variant = "USING";
     else if (/\bVALUES\s*\(\s*\.\.\.\s*\)/i.test(sql)) variant = "VALUES";
-    return `${table}_${verb}_${variant}`;
+    return variant ? `${table}_${verb}_${variant}` : `${table}_${verb}`;
   }
 
   /**
@@ -4122,7 +4126,7 @@
       el("div", {
         className: "pgss-activity-note",
         textContent:
-          "When on, IN-lists, VALUES lists and bind position variables are collapsed so recurring shapes share one template id. That template id is PRIMARY_TABLE_SQLVERB_VARIANT, derived from normalized SQL (a numeric suffix disambiguates collisions). Blank for singletons and rows with no resolvable template.",
+          "When on, IN-lists, VALUES lists and bind position variables are collapsed so recurring shapes share one template id. That template id is PRIMARY_TABLE_SQLVERB plus a shape suffix when the SQL has one (IN, JOIN, VALUES, ONCONFLICT_UPDATE, …), derived from normalized SQL (a numeric suffix disambiguates collisions). Blank for singletons and rows with no resolvable template.",
       })
     );
     return block;
