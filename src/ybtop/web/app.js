@@ -156,7 +156,7 @@
   let pgssGroupByTemplate = false;
   let ycqlGroupByTemplate = false;
   /**
-   * Viewer-wide: when true, query templates collapse IN-list arity, VALUES row-lists, $N binds,
+   * Viewer-wide: when true, query templates collapse IN-lists, VALUES row-lists, $N binds,
    * and per-call comments via normalizeQueryTemplate. When false, each distinct SQL string is its
    * own template key (whitespace trimmed only).
    */
@@ -4784,7 +4784,7 @@
           el("div", {
             className: "pgss-activity-note",
             textContent:
-              "YCQL uses ? bind markers, so only IN (...) list arity is normalized when grouping templates.",
+              "YCQL uses ? bind markers, so only IN (...) lists are normalized when grouping templates.",
           })
         );
       }

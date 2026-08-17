@@ -287,7 +287,7 @@ _WS_RE = re.compile(r"\s+")
 
 
 def normalize_query_template(query: Optional[str]) -> str:
-    """Collapse a query into a template that ignores per-call comments, IN-list, and VALUES arity.
+    """Collapse a query into a template that ignores per-call comments, IN-list length, and VALUES row count.
 
     1. Strip embedded per-call comments (e.g. ``/*rewritten_pid='123'*/``). Planner hints
        that start with ``/*+`` (pg_hint_plan / YSQL) are preserved so distinct hint sets stay
