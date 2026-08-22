@@ -1895,10 +1895,11 @@
       const raw = r.query_id != null && r.query_id !== undefined ? r.query_id : null;
       ent.samples += add;
       if ((!ent.query || ent.query === "") && q) ent.query = q;
-      // Heaviest member with resolvable SQL — empty-text buckets stay unstamped so the deep
-      // link does not name one arbitrary query_id for many unresolved sessions.
+      // Heaviest member: resolvable SQL always; unresolved SQL only when Merge already
+      // keyed the bucket by query_id (so Load Distribution can recompute the same key).
+      // The shared empty-text bucket (Merge off) stays unstamped.
       if (
-        q &&
+        (q || mergeSimilarSql) &&
         add > (ent._best_samples || 0) &&
         raw != null &&
         String(raw).trim() !== ""
@@ -2002,13 +2003,13 @@
       if (!ent.table_id && tid) ent.table_id = tid;
       if ((!ent.query || ent.query === "") && q) ent.query = q;
       if (
-        q &&
+        (q || mergeSimilarSql) &&
         add > (ent._best_samples || 0) &&
         raw != null &&
         String(raw).trim() !== ""
       ) {
         ent.query_id = raw;
-        ent.query = q;
+        if (q) ent.query = q;
         ent._best_samples = add;
       }
     });
