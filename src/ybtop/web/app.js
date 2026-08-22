@@ -149,13 +149,9 @@
   let ashTableIdFilter = null;
 
   /**
-   * "Group by query template" toggles (statement panels). When on, the panel's main table
-   * collapses to one row per query template (see mergeSimilarSql for whether IN/VALUES/$N are
-   * collapsed first). Flipping a toggle re-renders from the retained snapshot.
+   * Recurring-template visibility (per panel). Flipping a toggle re-renders from the retained snapshot.
    */
-  let pgssGroupByTemplate = false;
   let pgssShowRecurringTemplates = false;
-  let ycqlGroupByTemplate = false;
   let ycqlShowRecurringTemplates = false;
   let ashShowRecurringTemplates = false;
   let latencyShowRecurringTemplates = false;
@@ -1221,6 +1217,17 @@
     return mergeSimilarSql ? "canonical query" : "query";
   }
 
+  /**
+   * Grouping identity when Merge similar SQL is on. Canonical text when we have it; otherwise
+   * keep query_id so unresolved DocDB/YCQL/evicted rows do not collapse into one bucket.
+   */
+  function ashCanonicalGroupKey(r) {
+    const q = ashQueryGroupText(r.query);
+    if (q) return q;
+    const qid = normQid(r.query_id);
+    return qid != null && String(qid).trim() !== "" ? `\0qid:${String(qid)}` : "\0__no_query__";
+  }
+
   /** Group ASH rows by displayed object identity + resolved table_id (many aux values share one tablet/table). */
   function ashMergeKey(r) {
     return [
@@ -1236,7 +1243,7 @@
   /** Top-50 merge key when Merge similar SQL is on: table/index + canonical query + wait event. */
   function ashMergeKeyCanonical(r) {
     return [
-      ashQueryGroupText(r.query),
+      ashCanonicalGroupKey(r),
       r.wait_event_component,
       r.wait_event,
       r.wait_event_type,
@@ -1271,7 +1278,12 @@
       const ent = m.get(k);
       const add = Number(r.samples) || 0;
       ent.samples += add;
-      if (add > ent._best_samples && r.query_id != null && String(r.query_id).trim() !== "") {
+      if (
+        q &&
+        add > ent._best_samples &&
+        r.query_id != null &&
+        String(r.query_id).trim() !== ""
+      ) {
         ent.query_id = r.query_id;
         ent._best_samples = add;
       }
@@ -1788,10 +1800,7 @@
   }
 
   function bucketKeyAshQueryIdFlat(r) {
-    if (mergeSimilarSql) {
-      const q = ashQueryGroupText(r.query);
-      return q !== "" ? q : "\0__no_query__";
-    }
+    if (mergeSimilarSql) return ashCanonicalGroupKey(r);
     const raw = r.query_id != null && r.query_id !== undefined ? r.query_id : null;
     return raw != null && String(raw).trim() !== "" ? String(raw).trim() : "\0__no_query_id__";
   }
@@ -1799,7 +1808,7 @@
   function bucketKeyAshNamespaceQueryFlat(r) {
     const nn =
       r.namespace_name != null && r.namespace_name !== undefined ? String(r.namespace_name) : "";
-    return JSON.stringify([nn, ashQueryGroupText(r.query)]);
+    return JSON.stringify([nn, ashCanonicalGroupKey(r)]);
   }
 
   function bucketKeyAshNsObjBucketFlat(r) {
@@ -1822,7 +1831,7 @@
         r.table_id != null && r.table_id !== undefined && String(r.table_id).trim() !== ""
           ? String(r.table_id).trim()
           : "";
-      const q = ashQueryGroupText(r.query);
+      const q = ashCanonicalGroupKey(r);
       const dim = tid ? `tid:${tid}` : on;
       return ignoreQueryInKey ? JSON.stringify([nn, dim]) : JSON.stringify([nn, dim, q]);
     };
@@ -1863,7 +1872,7 @@
     (rows || []).forEach((r) => {
       const nn = r.namespace_name != null && r.namespace_name !== undefined ? String(r.namespace_name) : "";
       const q = ashQueryGroupText(r.query);
-      const k = JSON.stringify([nn, q]);
+      const k = JSON.stringify([nn, ashCanonicalGroupKey(r)]);
       if (!m.has(k)) {
         m.set(k, {
           namespace_name: nn,
@@ -1888,9 +1897,7 @@
       const raw = r.query_id != null && r.query_id !== undefined ? r.query_id : null;
       const q = ashQueryGroupText(r.query);
       const k = mergeSimilarSql
-        ? q !== ""
-          ? q
-          : "\0__no_query__"
+        ? ashCanonicalGroupKey(r)
         : raw != null && String(raw).trim() !== ""
           ? String(raw).trim()
           : "\0__no_query_id__";
@@ -1912,6 +1919,7 @@
       }
       if (
         mergeSimilarSql &&
+        k !== "\0__no_query__" &&
         add > (ent._best_samples || 0) &&
         raw != null &&
         String(raw).trim() !== ""
@@ -1946,7 +1954,9 @@
           : "";
       const q = ashQueryGroupText(r.query);
       const dim = tid ? `tid:${tid}` : on;
-      const k = ignoreQueryInKey ? JSON.stringify([nn, dim]) : JSON.stringify([nn, dim, q]);
+      const k = ignoreQueryInKey
+        ? JSON.stringify([nn, dim])
+        : JSON.stringify([nn, dim, ashCanonicalGroupKey(r)]);
       if (!m.has(k)) {
         m.set(k, {
           namespace_name: nn,
@@ -2753,6 +2763,18 @@
     td.appendChild(wrap);
   }
 
+  /**
+   * `query_id` an ASH deep link should scope to for a statement row. Collapsed template rows carry
+   * the template text as their `queryid`, so they name their heaviest real member instead.
+   */
+  function statementRowAshQueryId(row) {
+    const primary = row && row._tmpl_primary_queryid;
+    if (primary != null && String(primary).trim() !== "") return primary;
+    const qid = row && row.queryid;
+    if (qid != null && String(qid).trim() !== "" && !row._tmpl_member_count) return qid;
+    return null;
+  }
+
   function appendQueryCellWithAshLinks(td, queryVal, qid) {
     const full = String(queryVal || "");
     const wrap = el("div", { className: "query-cell" });
@@ -3008,21 +3030,25 @@
           } else if (
             ashCellOpts &&
             ashCellOpts.ashQueryIdLinks &&
-            col.key === "query_id" &&
-            row.query_id != null &&
-            String(row.query_id) !== ""
+            (col.key === "query_id" || col.key === "queryid")
           ) {
-            applyMonoTableCellClass(td, col);
-            const a = el("a", {
-              className: "ash-queryid-deeplink",
-              href: buildAshQueryHref(row.query_id),
-              textContent: v === null || v === undefined ? "" : String(v),
-            });
-            a.addEventListener("click", (e) => {
-              e.preventDefault();
-              navigateToAshForQueryId(row.query_id);
-            });
-            td.appendChild(a);
+            const qid = col.key === "queryid" ? row.queryid : row.query_id;
+            if (qid != null && String(qid).trim() !== "") {
+              applyMonoTableCellClass(td, col);
+              const a = el("a", {
+                className: "ash-queryid-deeplink",
+                href: buildAshQueryHref(qid),
+                textContent: v === null || v === undefined ? "" : String(v),
+              });
+              a.addEventListener("click", (e) => {
+                e.preventDefault();
+                navigateToAshForQueryId(qid);
+              });
+              td.appendChild(a);
+            } else {
+              applyMonoTableCellClass(td, col);
+              td.textContent = v === null || v === undefined ? "" : String(v);
+            }
           } else if (
             ashCellOpts &&
             ashCellOpts.ashNodeLinks &&
@@ -3093,10 +3119,6 @@
     const opt = tableOptions || {};
     const unifyStatementHeaders = !!opt.unifyStatementHeaders;
     const pgssAshLinks = !!opt.pgssAshLinks;
-    // Canonicalized text stands for a family of statements, so it is never a per-query deep link;
-    // keeping it plain also makes the column render identically with grouping on or off.
-    const pgssQueryTextLinks =
-      opt.pgssQueryTextLinks !== undefined ? !!opt.pgssQueryTextLinks : pgssAshLinks;
     const ashCellOpts = opt.ashCellOpts;
     const section = el("section", { className: "ybtop-section" });
     const h2 = el("h2", { className: "section-title" });
@@ -3209,8 +3231,9 @@
           if (col.key === "query") {
             applyMonoTableCellClass(td, col);
             const qid = row.query_id != null && row.query_id !== undefined ? row.query_id : row.queryid;
-            if (pgssQueryTextLinks && row.queryid != null && String(row.queryid) !== "") {
-              appendQueryCellWithAshLinks(td, v, row.queryid);
+            const stmtQid = statementRowAshQueryId(row);
+            if (pgssAshLinks && stmtQid != null) {
+              appendQueryCellWithAshLinks(td, v, stmtQid);
             } else if (
               ashCellOpts &&
               ashCellOpts.ashQueryTextLinks &&
@@ -3293,21 +3316,25 @@
           } else if (
             ashCellOpts &&
             ashCellOpts.ashQueryIdLinks &&
-            col.key === "query_id" &&
-            row.query_id != null &&
-            String(row.query_id) !== ""
+            (col.key === "query_id" || col.key === "queryid")
           ) {
-            applyMonoTableCellClass(td, col);
-            const a = el("a", {
-              className: "ash-queryid-deeplink",
-              href: buildAshQueryHref(row.query_id),
-              textContent: v === null || v === undefined ? "" : String(v),
-            });
-            a.addEventListener("click", (e) => {
-              e.preventDefault();
-              navigateToAshForQueryId(row.query_id);
-            });
-            td.appendChild(a);
+            const qid = col.key === "queryid" ? row.queryid : row.query_id;
+            if (qid != null && String(qid).trim() !== "") {
+              applyMonoTableCellClass(td, col);
+              const a = el("a", {
+                className: "ash-queryid-deeplink",
+                href: buildAshQueryHref(qid),
+                textContent: v === null || v === undefined ? "" : String(v),
+              });
+              a.addEventListener("click", (e) => {
+                e.preventDefault();
+                navigateToAshForQueryId(qid);
+              });
+              td.appendChild(a);
+            } else {
+              applyMonoTableCellClass(td, col);
+              td.textContent = v === null || v === undefined ? "" : String(v);
+            }
           } else if (
             ashCellOpts &&
             ashCellOpts.ashNodeLinks &&
@@ -3943,10 +3970,19 @@
       const dbs = new Set();
       const queryids = [];
       let anyPrepared = false;
+      // Heaviest member with a real id: the collapsed row's `queryid` is the template text, so ASH
+      // deep links need a statement that actually exists to scope to.
+      let primaryQueryid = null;
+      let primaryMs = -1;
       members.forEach((m) => {
         const s = deltaSrcFromRowFallback(m);
         calls += Number(s.calls) || 0;
         exec += Number(s.total_exec_time) || 0;
+        const memberMs = Number(s.total_exec_time) || 0;
+        if (memberMs > primaryMs && m.queryid != null && String(m.queryid).trim() !== "") {
+          primaryQueryid = String(m.queryid);
+          primaryMs = memberMs;
+        }
         if (s.rows != null) rows += Number(s.rows) || 0;
         if (s.doc) {
           Object.keys(s.doc).forEach((k) => {
@@ -3965,6 +4001,7 @@
         mean_ms: calls ? Math.round((exec / calls) * 100) / 100 : 0,
         _tmpl_member_count: members.length,
         _tmpl_queryids: queryids,
+        _tmpl_primary_queryid: primaryQueryid,
       };
       if (hasDbname) row.dbname = g.dbname || null;
       if (hasPrepared) row.is_prepared = anyPrepared;
@@ -4153,6 +4190,15 @@
     return cols;
   }
 
+  function groupedStatementDisplayColumns(baseCols) {
+    return relabelQueryColumn(
+      groupedStatementColumns(baseCols).filter(
+        (c) => c.key !== "template_label" && c.key !== "_tmpl_member_count"
+      ),
+      "canonical query"
+    );
+  }
+
   /** ASH sample grouping by normalized query template; sums samples, counts distinct query_ids. */
   function groupAshByTemplate(rows) {
     const m = new Map();
@@ -4323,7 +4369,7 @@
     });
   }
 
-  /** Small reusable "Group by query template" checkbox control. */
+  /** Small reusable labeled checkbox (recurring-templates visibility, etc.). */
   function buildGroupByTemplateControl(checked, onChange, opts) {
     const options = opts || {};
     const disabled = !!options.disabled;
@@ -4360,10 +4406,7 @@
     chk.addEventListener("change", () => {
       mergeSimilarSql = chk.checked;
       if (!mergeSimilarSql) {
-        // Group-by-template only makes sense once similar SQL has been collapsed into templates.
-        pgssGroupByTemplate = false;
         pgssShowRecurringTemplates = false;
-        ycqlGroupByTemplate = false;
         ycqlShowRecurringTemplates = false;
         ashShowRecurringTemplates = false;
         latencyShowRecurringTemplates = false;
@@ -4587,7 +4630,7 @@
     panel.appendChild(
       buildShowRecurringTemplatesControl(mergeSimilarSql && latencyShowRecurringTemplates, (v) => {
         latencyShowRecurringTemplates = v;
-        if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+        rerender();
       })
     );
 
@@ -4702,7 +4745,7 @@
         { key: "peaks", label: "peaks", type: "number", align: "right" },
         { key: "spread", label: "spread" },
         { key: "gap", label: "gap" },
-        { key: "query", label: mergeSimilarSql ? "canonicalized query" : "query" },
+        { key: "query", label: mergeSimilarSql ? "canonical query" : "query" },
         { key: "queryid", label: "queryid" }
       );
       tableHolder.textContent = "";
@@ -4713,7 +4756,8 @@
           `Latency modes — ${displayRows.length} shown (${flaggedN} flagged / ${total} analyzed)`,
           displayRows,
           cols,
-          "sec-latency-main"
+          "sec-latency-main",
+          { ashQueryTextLinks: true, ashQueryIdLinks: true }
         )
       );
 
@@ -4823,7 +4867,7 @@
       const merged = mergeStatements(st);
       const prevSt = prevDoc && prevDoc.pg_stat_statements && prevDoc.pg_stat_statements.per_node;
       const isDelta = !!(prevDoc && prevSt);
-      const grouped = mergeSimilarSql && pgssGroupByTemplate;
+      const grouped = mergeSimilarSql;
       const pgSort = { key: "total_ms", dir: "desc" };
 
       if (isDelta) {
@@ -4856,16 +4900,6 @@
       }
 
       panelPgss.appendChild(buildMergeSimilarSqlControl());
-      panelPgss.appendChild(
-        buildGroupByTemplateControl(
-          grouped,
-          (v) => {
-            pgssGroupByTemplate = v;
-            if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
-          },
-          { disabled: !mergeSimilarSql }
-        )
-      );
       panelPgss.appendChild(
         buildShowRecurringTemplatesControl(mergeSimilarSql && pgssShowRecurringTemplates, (v) => {
           pgssShowRecurringTemplates = v;
@@ -4900,6 +4934,9 @@
           const memberByKey = new Map(
             collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
           );
+          const primaryByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
+          );
           pgRows = withPgStatDeltaDerivedRows(
             deltaPgStatMergedRows(collapsedCur, collapsedPrev),
             prevDoc.generated_at_utc,
@@ -4907,24 +4944,15 @@
           );
           pgRows.forEach((r) => {
             r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
+            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
           });
           applyCanonicalizedQueryText(pgRows);
-          pgCols = relabelQueryColumn(
-            groupedStatementColumns(pgStatStatementColumnsDelta(pgRows, st)).filter(
-              (c) => c.key !== "template_label" && c.key !== "_tmpl_member_count"
-            ),
-            "canonicalized query"
-          );
+          pgCols = groupedStatementDisplayColumns(pgStatStatementColumnsDelta(pgRows, st));
           pgTitle = "Top 25 — pg_stat_statements (Δ vs prior snapshot)";
         } else {
           pgRows = withPgStatTimePercent(collapseStatementsByTemplate(merged));
           applyCanonicalizedQueryText(pgRows);
-          pgCols = relabelQueryColumn(
-            groupedStatementColumns(pgStatStatementColumns(pgRows, st)).filter(
-              (c) => c.key !== "template_label" && c.key !== "_tmpl_member_count"
-            ),
-            "canonicalized query"
-          );
+          pgCols = groupedStatementDisplayColumns(pgStatStatementColumns(pgRows, st));
           pgTitle = "Top 25 — pg_stat_statements";
         }
       } else {
@@ -4934,7 +4962,7 @@
           : pgStatStatementColumns(pgRows, st);
         if (mergeSimilarSql) {
           applyCanonicalizedQueryText(pgRows);
-          pgCols = relabelQueryColumn(pgBaseCols, "canonicalized query");
+          pgCols = relabelQueryColumn(pgBaseCols, "canonical query");
         } else {
           pgCols = pgBaseCols;
         }
@@ -4946,8 +4974,7 @@
       panelPgss.appendChild(
         buildSortablePaginatedTable(pgTitle, pgRows, pgCols, 25, "sec-pgss-main", pgSort, {
           unifyStatementHeaders: true,
-          pgssAshLinks: !grouped,
-          pgssQueryTextLinks: !grouped && !mergeSimilarSql,
+          pgssAshLinks: true,
         })
       );
     } else {
@@ -4964,7 +4991,7 @@
       const prevYcqlSt =
         prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
       const isDelta = !!(prevDoc && prevYcqlSt);
-      const grouped = mergeSimilarSql && ycqlGroupByTemplate;
+      const grouped = mergeSimilarSql;
       const ycqlSort = { key: "total_ms", dir: "desc" };
 
       if (isDelta) {
@@ -5007,16 +5034,6 @@
         )
       );
       panelYcql.appendChild(
-        buildGroupByTemplateControl(
-          grouped,
-          (v) => {
-            ycqlGroupByTemplate = v;
-            if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
-          },
-          { disabled: !mergeSimilarSql }
-        )
-      );
-      panelYcql.appendChild(
         buildShowRecurringTemplatesControl(mergeSimilarSql && ycqlShowRecurringTemplates, (v) => {
           ycqlShowRecurringTemplates = v;
           if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
@@ -5051,7 +5068,10 @@
             collapsedCur.map((r) => [statementMergeKey(r), !!r.is_prepared])
           );
           const memberByKey = new Map(
-            collapsedCur.map((r) => [String(r.queryid), r._tmpl_member_count])
+            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
+          );
+          const primaryByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
           );
           ycqlRows = withPgStatDeltaDerivedRows(
             deltaPgStatMergedRows(collapsedCur, collapsedPrev).map((r) => ({
@@ -5062,16 +5082,17 @@
             doc.generated_at_utc
           );
           ycqlRows.forEach((r) => {
-            r._tmpl_member_count = memberByKey.get(String(r.queryid)) || 1;
+            r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
+            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
           });
-          labelCollapsedTemplateRows(ycqlRows, ycqlSummary);
-          ycqlCols = groupedStatementColumns(ycqlStatStatementColumnsDelta());
-          ycqlTitle = "ycql_stat_statements by template (Δ vs prior snapshot)";
+          applyCanonicalizedQueryText(ycqlRows);
+          ycqlCols = groupedStatementDisplayColumns(ycqlStatStatementColumnsDelta());
+          ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
         } else {
           ycqlRows = withPgStatTimePercent(collapseStatementsByTemplate(mergedYcql));
-          labelCollapsedTemplateRows(ycqlRows, ycqlSummary);
-          ycqlCols = groupedStatementColumns(ycqlStatStatementColumns());
-          ycqlTitle = "ycql_stat_statements by template";
+          applyCanonicalizedQueryText(ycqlRows);
+          ycqlCols = groupedStatementDisplayColumns(ycqlStatStatementColumns());
+          ycqlTitle = "Top 25 — ycql_stat_statements";
         }
       } else {
         ycqlRows = baseRows;
@@ -5079,9 +5100,11 @@
           ? ycqlStatStatementColumnsDelta()
           : ycqlStatStatementColumns();
         if (mergeSimilarSql) {
-          tagRowsWithTemplate(ycqlRows, "total_ms", ycqlSummary);
+          applyCanonicalizedQueryText(ycqlRows);
+          ycqlCols = relabelQueryColumn(ycqlBaseCols, "canonical query");
+        } else {
+          ycqlCols = ycqlBaseCols;
         }
-        ycqlCols = mergeSimilarSql ? withTmplColumn(ycqlBaseCols) : ycqlBaseCols;
         ycqlTitle = isDelta
           ? "Top 25 — ycql_stat_statements (Δ vs prior snapshot)"
           : "Top 25 — ycql_stat_statements";
@@ -5097,8 +5120,7 @@
           ycqlSort,
           {
             unifyStatementHeaders: true,
-            pgssAshLinks: !grouped,
-            pgssQueryTextLinks: !grouped && !mergeSimilarSql,
+            pgssAshLinks: true,
           }
         )
       );
@@ -5290,8 +5312,8 @@
         { key: "query_members", label: "member query_ids (ranked)", sortable: false },
       ];
 
-      // Recurring query templates for ASH (template_id rank/count on query-bearing tables).
-      // No "Group by query template" swap here — the wait-event Top 50 stays the main table.
+      // Recurring query templates for ASH. The wait-event Top 50 stays the main table; Merge similar SQL
+      // only changes how that table groups query text.
       const byTemplateL = !qF
         ? withAshTemplateMemberRates(ashEnriched(labelAshTemplates(groupAshByTemplate(mergedAshByQueryId))))
         : [];
@@ -5391,7 +5413,7 @@
             { key: "namespace_name", label: "namespace" },
             {
               key: "query",
-              label: mergeSimilarSql ? "canonicalized query" : "query",
+              label: mergeSimilarSql ? "canonical query" : "query",
             },
           ].concat(mergeSimilarSql ? [] : [{ key: "query_id", label: "query_id" }]),
           ashClusterNodes,
