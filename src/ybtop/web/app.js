@@ -164,7 +164,7 @@
    * and per-call comments via normalizeQueryTemplate. When false, each distinct SQL string is its
    * own template key (whitespace trimmed only).
    */
-  let mergeSimilarSql = true;
+  let mergeSimilarSql = false;
   /** Latency modes tab: include the dip_p column when true (browser-only UI preference). */
   let latencyShowDipP = true;
 
