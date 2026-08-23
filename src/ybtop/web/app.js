@@ -165,6 +165,8 @@
    * own template key (whitespace trimmed only).
    */
   let mergeSimilarSql = false;
+  /** Prior Merge value while a canonical-family ASH URL forces grouping on; null when not held. */
+  let mergeSimilarSqlSavedForFamily = null;
   /** Latency modes tab: include the dip_p column when true (browser-only UI preference). */
   let latencyShowDipP = true;
   /** Survive Merge similar SQL / full renderDoc rebuilds (same idea as latencyShowDipP). */
@@ -243,9 +245,6 @@
       ashCanonicalizeFilter && dbname != null && String(dbname).trim() !== ""
         ? String(dbname).trim()
         : null;
-    // A canonical family link must render the same grouping after a reload, even though Merge
-    // similar SQL otherwise defaults off.
-    if (ashCanonicalizeFilter) mergeSimilarSql = true;
     const n = p.get("node");
     ashNodeIdFilter = n != null && String(n).trim() !== "" ? String(n).trim() : null;
     const tb = p.get("table_id");
@@ -256,6 +255,23 @@
       ashCanonicalDbnameFilter = null;
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
+    }
+    syncMergeSimilarSqlForFamilyScope();
+  }
+
+  /**
+   * Family ASH URLs need Merge similar SQL on so grouping survives reload, but that must not
+   * stick after the user leaves the family view. Hold and restore the toggle they actually set.
+   */
+  function syncMergeSimilarSqlForFamilyScope() {
+    if (ashCanonicalizeFilter) {
+      if (mergeSimilarSqlSavedForFamily === null) {
+        mergeSimilarSqlSavedForFamily = mergeSimilarSql;
+      }
+      mergeSimilarSql = true;
+    } else if (mergeSimilarSqlSavedForFamily !== null) {
+      mergeSimilarSql = mergeSimilarSqlSavedForFamily;
+      mergeSimilarSqlSavedForFamily = null;
     }
   }
 
@@ -310,6 +326,7 @@
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
     }
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = id;
     const app = document.getElementById("app");
     if (!app) return;
@@ -1473,21 +1490,12 @@
 
   function filterAshPerNodeByCanonicalFamily(perNode, family) {
     if (!family || !family.queryIds || !family.queryIds.size) return perNode;
-    const wanted = family.queryIds;
+    const wanted = Array.from(family.queryIds);
     const out = {};
     Object.keys(perNode || {}).forEach((nid) => {
-      const rows = (perNode[nid] || []).filter((r) => {
-        const qid = r.query_id != null && r.query_id !== undefined ? r.query_id : r.queryid;
-        if (qid == null || !wanted.has(String(qid).trim())) return false;
-        if (family.source !== "ysql" || !family.dbname) return true;
-        // ASH resolves namespace_name from ysql_dbid via pg_database, so this preserves the
-        // same dbname boundary used by the grouped YSQL statement row.
-        const namespace =
-          r.namespace_name != null && r.namespace_name !== undefined
-            ? String(r.namespace_name).trim()
-            : "";
-        return namespace === String(family.dbname);
-      });
+      const rows = (perNode[nid] || []).filter((r) =>
+        wanted.some((qid) => rowMatchesAshQueryIdFilter(r, qid))
+      );
       if (rows.length) out[nid] = rows;
     });
     return out;
@@ -1749,6 +1757,7 @@
         : null;
     ashNodeIdFilter = null;
     ashTableIdFilter = null;
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     /* pushState so the browser Back button returns to the prior tab (e.g. statements). */
     writeViewerStateToUrl({ push: true });
@@ -1765,6 +1774,7 @@
     ashCanonicalizeFilter = false;
     ashCanonicalDbnameFilter = null;
     ashTableIdFilter = null;
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
     if (lastDoc) {
@@ -1780,6 +1790,7 @@
     ashCanonicalizeFilter = false;
     ashCanonicalDbnameFilter = null;
     ashNodeIdFilter = null;
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
     if (lastDoc) {
@@ -4221,14 +4232,21 @@
 
   /** Summary rows (member_count > 1) for the statement panels' "Recurring query templates" table. */
   function statementTemplateSummaryRows(rows) {
+    const hasDbname = (rows || []).some((r) => Object.prototype.hasOwnProperty.call(r, "dbname"));
     const groups = new Map();
     (rows || []).forEach((r) => {
-      const key = queryTemplateKey(r.query);
-      if (!key) return;
+      const template = queryTemplateKey(r.query);
+      if (!template) return;
+      const dbname =
+        hasDbname && r.dbname != null && String(r.dbname).trim() !== ""
+          ? String(r.dbname).trim()
+          : "";
+      const key = hasDbname ? `${template}\0${dbname}` : template;
       if (!groups.has(key)) {
         groups.set(key, {
-          query_template: key,
-          template: key,
+          query_template: template,
+          template: template,
+          dbname: hasDbname ? dbname || null : undefined,
           calls: 0,
           calls_per_sec: 0,
           total_ms: 0,
@@ -4271,7 +4289,7 @@
             calls_per_sec: Math.round(member.calls_per_sec * 100) / 100,
             rank: i + 1,
           }));
-        return {
+        const row = {
           query_template: g.query_template,
           template: g.template,
           members: queryMembers.length,
@@ -4282,6 +4300,8 @@
           query_members: queryMembers,
           queryids: queryMembers.map((m) => m.query_id).join(", "),
         };
+        if (hasDbname) row.dbname = g.dbname != null ? g.dbname : null;
+        return row;
       })
       .filter((g) => g.members > 1)
       .sort((a, b) => b.total_ms - a.total_ms);
@@ -4300,7 +4320,12 @@
     }
     cols.push(
       { key: "total_ms", label: "total time (ms)", type: "number", align: "right" },
-      { key: "time_pct", label: "time %", type: "number", align: "right" },
+      { key: "time_pct", label: "time %", type: "number", align: "right" }
+    );
+    if (options.dbname) {
+      cols.push({ key: "dbname", label: "dbname" });
+    }
+    cols.push(
       { key: "template", label: "canonical query" },
       { key: "query_members", label: "member queryids (ranked)", sortable: false }
     );
@@ -4415,6 +4440,9 @@
     chk.checked = !!mergeSimilarSql;
     chk.addEventListener("change", () => {
       mergeSimilarSql = chk.checked;
+      if (mergeSimilarSqlSavedForFamily !== null) {
+        mergeSimilarSqlSavedForFamily = mergeSimilarSql;
+      }
       if (!mergeSimilarSql) {
         pgssShowRecurringTemplates = false;
         ycqlShowRecurringTemplates = false;
@@ -4935,7 +4963,10 @@
           buildSortableTable(
             `Recurring query templates (${pgSummary.length})`,
             pgSummary,
-            statementTemplateSummaryColumns({ callsPerSec: isDelta }),
+            statementTemplateSummaryColumns({
+              callsPerSec: isDelta,
+              dbname: pgSummary.some((r) => Object.prototype.hasOwnProperty.call(r, "dbname")),
+            }),
             "sec-pgss-templates",
             undefined,
             STATEMENT_TEMPLATE_SUMMARY_SORT
