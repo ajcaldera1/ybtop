@@ -145,6 +145,10 @@
   let activeViewerSection = "pgss";
   /** ASH filters from URL / deeplinks; cleared when leaving the ASH tab. */
   let ashQueryIdFilter = null;
+  /** Expand ashQueryIdFilter to every statement in its canonical-query family. */
+  let ashCanonicalizeFilter = false;
+  /** YSQL canonical families are database-scoped; null lets direct URLs pick the dominant match. */
+  let ashCanonicalDbnameFilter = null;
   let ashNodeIdFilter = null;
   let ashTableIdFilter = null;
 
@@ -230,12 +234,26 @@
     }
     const q = p.get("query");
     ashQueryIdFilter = q != null && String(q) !== "" ? String(q) : null;
+    const canonicalize = p.get("canonicalize");
+    ashCanonicalizeFilter =
+      ashQueryIdFilter != null &&
+      (canonicalize === "t" || canonicalize === "true" || canonicalize === "1");
+    const dbname = p.get("dbname");
+    ashCanonicalDbnameFilter =
+      ashCanonicalizeFilter && dbname != null && String(dbname).trim() !== ""
+        ? String(dbname).trim()
+        : null;
+    // A canonical family link must render the same grouping after a reload, even though Merge
+    // similar SQL otherwise defaults off.
+    if (ashCanonicalizeFilter) mergeSimilarSql = true;
     const n = p.get("node");
     ashNodeIdFilter = n != null && String(n).trim() !== "" ? String(n).trim() : null;
     const tb = p.get("table_id");
     ashTableIdFilter = tb != null && String(tb).trim() !== "" ? String(tb).trim() : null;
     if (activeViewerSection !== "ash") {
       ashQueryIdFilter = null;
+      ashCanonicalizeFilter = false;
+      ashCanonicalDbnameFilter = null;
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
     }
@@ -255,6 +273,10 @@
     if (windowKey) p.set("t", windowKey);
     if (activeViewerSection === "ash") {
       if (ashQueryIdFilter) p.set("query", ashQueryIdFilter);
+      if (ashQueryIdFilter && ashCanonicalizeFilter) {
+        p.set("canonicalize", "t");
+        if (ashCanonicalDbnameFilter) p.set("dbname", ashCanonicalDbnameFilter);
+      }
       if (ashNodeIdFilter) p.set("node", ashNodeIdFilter);
       if (ashTableIdFilter) p.set("table_id", ashTableIdFilter);
     }
@@ -265,6 +287,8 @@
       view: activeViewerSection,
       t: windowKey,
       query: ashQueryIdFilter || null,
+      canonicalize: ashCanonicalizeFilter || false,
+      dbname: ashCanonicalDbnameFilter || null,
       node: ashNodeIdFilter || null,
       table_id: ashTableIdFilter || null,
     };
@@ -281,6 +305,8 @@
       !!ashQueryIdFilter || !!ashNodeIdFilter || !!ashTableIdFilter;
     if (id !== "ash") {
       ashQueryIdFilter = null;
+      ashCanonicalizeFilter = false;
+      ashCanonicalDbnameFilter = null;
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
     }
@@ -570,9 +596,15 @@
    * Sum `calls` on one node for a merged statement row.
    * YSQL: queryid + dbname; YCQL: queryid only.
    */
-  function statementCallsOnNodeMatching(perNode, nodeId, stmtRow, matchDbname) {
+  function statementCallsOnNodeMatching(
+    perNode,
+    nodeId,
+    stmtRow,
+    matchDbname,
+    canonicalFamily
+  ) {
     const wantQ = normQid(stmtRow.queryid);
-    if (wantQ == null) return 0;
+    if (wantQ == null && !canonicalFamily) return 0;
     const dn =
       matchDbname && stmtRow.dbname != null && stmtRow.dbname !== undefined
         ? String(stmtRow.dbname).trim()
@@ -581,7 +613,11 @@
     const rows = (perNode || {})[nid] || [];
     let sum = 0;
     rows.forEach((r) => {
-      if (normQid(r.queryid) !== wantQ) return;
+      if (canonicalFamily) {
+        if (!statementRowMatchesCanonicalFamily(r, canonicalFamily)) return;
+      } else if (normQid(r.queryid) !== wantQ) {
+        return;
+      }
       if (matchDbname) {
         const rdn = r.dbname != null && r.dbname !== undefined ? String(r.dbname).trim() : "";
         if (rdn !== dn) return;
@@ -595,17 +631,36 @@
    * Per-node positive contributions for the scoped statement: cumulative calls, or Δcalls vs prior when deltaMode.
    * Same “positive weights only” split as ASH load distribution (summarizeAshNodeLoadPct).
    */
-  function statementCallsContributorsPerNodeMap(perNode, stmtRow, prevPerNode, deltaMode, matchDbname) {
+  function statementCallsContributorsPerNodeMap(
+    perNode,
+    stmtRow,
+    prevPerNode,
+    deltaMode,
+    matchDbname,
+    canonicalFamily
+  ) {
     const keys = new Set(Object.keys(perNode || {}));
     if (deltaMode && prevPerNode) {
       Object.keys(prevPerNode).forEach((k) => keys.add(k));
     }
     const nm = new Map();
     keys.forEach((nid) => {
-      const cur = statementCallsOnNodeMatching(perNode, nid, stmtRow, matchDbname);
+      const cur = statementCallsOnNodeMatching(
+        perNode,
+        nid,
+        stmtRow,
+        matchDbname,
+        canonicalFamily
+      );
       let metric = cur;
       if (deltaMode && prevPerNode) {
-        const prev = statementCallsOnNodeMatching(prevPerNode, nid, stmtRow, matchDbname);
+        const prev = statementCallsOnNodeMatching(
+          prevPerNode,
+          nid,
+          stmtRow,
+          matchDbname,
+          canonicalFamily
+        );
         metric = cur - prev;
       }
       if (metric > 0) nm.set(String(nid), metric);
@@ -682,6 +737,7 @@
     if (want == null || !perNode) return false;
 
     const matchDbname = !!(opts && opts.matchDbname);
+    const canonicalFamily = opts && opts.canonicalFamily;
     const hasRowsCol = matchDbname && pgStatPerNodeHasRowsColumn(perNode);
 
     const merged = mergeFn(perNode);
@@ -690,15 +746,24 @@
     if (prevDoc && prevPerNode) {
       deltaMode = true;
       const mergedPrev = mergeFn(prevPerNode);
-      const deltaRows = deltaPgStatMergedRows(merged, mergedPrev);
+      const currentRows = canonicalFamily ? collapseStatementsByTemplate(merged) : merged;
+      const previousRows = canonicalFamily ? collapseStatementsByTemplate(mergedPrev) : mergedPrev;
+      const deltaRows = deltaPgStatMergedRows(currentRows, previousRows);
       const derived = withPgStatDeltaDerivedRows(
         deltaRows,
         prevDoc.generated_at_utc,
         doc.generated_at_utc
       );
-      stmtRow = pickMergedPgStatRowForQueryId(derived, qF);
+      stmtRow = canonicalFamily
+        ? derived.find((row) => statementRowMatchesCanonicalFamily(row, canonicalFamily)) || null
+        : pickMergedPgStatRowForQueryId(derived, qF);
     } else {
-      stmtRow = pickMergedPgStatRowForQueryId(withPgStatTimePercent(merged), qF);
+      const displayRows = withPgStatTimePercent(
+        canonicalFamily ? collapseStatementsByTemplate(merged) : merged
+      );
+      stmtRow = canonicalFamily
+        ? displayRows.find((row) => statementRowMatchesCanonicalFamily(row, canonicalFamily)) || null
+        : pickMergedPgStatRowForQueryId(displayRows, qF);
     }
 
     if (!stmtRow) {
@@ -726,7 +791,8 @@
       stmtRow,
       prevPerNode,
       deltaMode,
-      matchDbname
+      matchDbname,
+      canonicalFamily
     );
     const callsDist = summarizeAshNodeLoadPct(contribMap);
     appendAshBannerCallsDistributionRow(noteEl, clusterNodes, callsDist);
@@ -768,7 +834,14 @@
    * Statement summary under the ASH query banner: pg_stat_statements when present, else ycql_stat_statements.
    * @param ashPerNode ASH per_node map (unfiltered) for cluster node count only.
    */
-  function appendAshScopedQueryStatementLines(noteEl, doc, prevDoc, qF, ashPerNode) {
+  function appendAshScopedQueryStatementLines(
+    noteEl,
+    doc,
+    prevDoc,
+    qF,
+    ashPerNode,
+    canonicalFamily
+  ) {
     const pgPer = doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node;
     const ycqlPer = doc && doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
     const prevPg =
@@ -776,8 +849,16 @@
     const prevYcql =
       prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
 
-    const inPg = mergedStatementRowForQuery(pgPer, mergeStatements, qF);
-    const inYcql = mergedStatementRowForQuery(ycqlPer, mergeYcqlStatements, qF);
+    const inPg = canonicalFamily
+      ? canonicalFamily.source === "ysql"
+        ? canonicalFamily
+        : null
+      : mergedStatementRowForQuery(pgPer, mergeStatements, qF);
+    const inYcql = canonicalFamily
+      ? canonicalFamily.source === "ycql"
+        ? canonicalFamily
+        : null
+      : mergedStatementRowForQuery(ycqlPer, mergeYcqlStatements, qF);
 
     if (inPg) {
       if (
@@ -791,7 +872,7 @@
           pgPer,
           prevPg,
           mergeStatements,
-          { matchDbname: true }
+          { matchDbname: true, canonicalFamily }
         )
       ) {
         ashBannerMetricRow(
@@ -814,7 +895,7 @@
           ycqlPer,
           prevYcql,
           mergeYcqlStatements,
-          { matchDbname: false, showIsPrepared: true }
+          { matchDbname: false, showIsPrepared: true, canonicalFamily }
         )
       ) {
         ashBannerMetricRow(
@@ -1390,6 +1471,28 @@
     return out;
   }
 
+  function filterAshPerNodeByCanonicalFamily(perNode, family) {
+    if (!family || !family.queryIds || !family.queryIds.size) return perNode;
+    const wanted = family.queryIds;
+    const out = {};
+    Object.keys(perNode || {}).forEach((nid) => {
+      const rows = (perNode[nid] || []).filter((r) => {
+        const qid = r.query_id != null && r.query_id !== undefined ? r.query_id : r.queryid;
+        if (qid == null || !wanted.has(String(qid).trim())) return false;
+        if (family.source !== "ysql" || !family.dbname) return true;
+        // ASH resolves namespace_name from ysql_dbid via pg_database, so this preserves the
+        // same dbname boundary used by the grouped YSQL statement row.
+        const namespace =
+          r.namespace_name != null && r.namespace_name !== undefined
+            ? String(r.namespace_name).trim()
+            : "";
+        return namespace === String(family.dbname);
+      });
+      if (rows.length) out[nid] = rows;
+    });
+    return out;
+  }
+
   function filterAshPerNodeByNodeId(perNode, nodeIdStr) {
     const want = String(nodeIdStr || "").trim();
     if (want === "") return perNode;
@@ -1590,11 +1693,34 @@
     return cols.filter((c) => c.key !== "query_id" && c.key !== "query");
   }
 
-  function buildAshQueryHref(qid) {
+  /** Canonical-family scope keeps the representative query_id but hides repeated canonical SQL. */
+  function ashColumnsWithoutQuery(cols) {
+    return cols
+      .filter((c) => c.key !== "query")
+      .map((c) =>
+        c.key === "query_id" ? Object.assign({}, c, { label: "representative query_id" }) : c
+      );
+  }
+
+  function buildAshQueryHref(qid, options) {
+    const opts = options || {};
     const p = new URLSearchParams();
     p.set("view", "ash");
     p.set("query", String(qid));
+    if (opts.canonicalize) {
+      p.set("canonicalize", "t");
+      if (opts.dbname != null && String(opts.dbname).trim() !== "") {
+        p.set("dbname", String(opts.dbname).trim());
+      }
+    }
     return `${window.location.pathname}?${p.toString()}`;
+  }
+
+  /** When a table opts into family drilldowns, query-text links expand the canonical family. */
+  function ashFamilyLinkOptions(row, cellOpts) {
+    if (!cellOpts || !cellOpts.canonicalizeFamily) return {};
+    const dbname = row && row.dbname != null ? row.dbname : null;
+    return { canonicalize: true, dbname: dbname };
   }
 
   function buildAshNodeHref(nodeId) {
@@ -1611,10 +1737,16 @@
     return `${window.location.pathname}?${p.toString()}`;
   }
 
-  function navigateToAshForQueryId(qid) {
+  function navigateToAshForQueryId(qid, options) {
+    const opts = options || {};
     const s = String(qid).trim();
     if (!s) return;
     ashQueryIdFilter = s;
+    ashCanonicalizeFilter = !!opts.canonicalize;
+    ashCanonicalDbnameFilter =
+      ashCanonicalizeFilter && opts.dbname != null && String(opts.dbname).trim() !== ""
+        ? String(opts.dbname).trim()
+        : null;
     ashNodeIdFilter = null;
     ashTableIdFilter = null;
     activeViewerSection = "ash";
@@ -1630,6 +1762,8 @@
     if (!s) return;
     ashNodeIdFilter = s;
     ashQueryIdFilter = null;
+    ashCanonicalizeFilter = false;
+    ashCanonicalDbnameFilter = null;
     ashTableIdFilter = null;
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
@@ -1643,6 +1777,8 @@
     if (!s) return;
     ashTableIdFilter = s;
     ashQueryIdFilter = null;
+    ashCanonicalizeFilter = false;
+    ashCanonicalDbnameFilter = null;
     ashNodeIdFilter = null;
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
@@ -2805,29 +2941,35 @@
     td.appendChild(wrap);
   }
 
-  /**
-   * `query_id` an ASH deep link should scope to for a statement row. Collapsed template rows carry
-   * the template text as their `queryid`, so they name their heaviest real member instead.
-   */
-  function statementRowAshQueryId(row) {
+  /** ASH link target for a statement row; collapsed rows open the whole canonical family. */
+  function statementRowAshLink(row) {
     const primary = row && row._tmpl_primary_queryid;
-    if (primary != null && String(primary).trim() !== "") return primary;
+    if (primary != null && String(primary).trim() !== "") {
+      return {
+        queryId: primary,
+        canonicalize: true,
+        dbname: row.dbname != null ? row.dbname : null,
+      };
+    }
     const qid = row && row.queryid;
-    if (qid != null && String(qid).trim() !== "" && !row._tmpl_member_count) return qid;
+    if (qid != null && String(qid).trim() !== "" && !row._tmpl_member_count) {
+      return { queryId: qid, canonicalize: false, dbname: null };
+    }
     return null;
   }
 
-  function appendQueryCellWithAshLinks(td, queryVal, qid) {
+  function appendQueryCellWithAshLinks(td, queryVal, qid, options) {
+    const opts = options || {};
     const full = String(queryVal || "");
     const wrap = el("div", { className: "query-cell" });
     const a = el("a", {
       className: "query-preview query-ash-deeplink",
-      href: buildAshQueryHref(qid),
+      href: buildAshQueryHref(qid, opts),
       textContent: full,
     });
     a.addEventListener("click", (e) => {
       e.preventDefault();
-      navigateToAshForQueryId(qid);
+      navigateToAshForQueryId(qid, opts);
     });
     wrap.appendChild(a);
     const btn = el("button", {
@@ -3008,7 +3150,7 @@
               qid != null &&
               String(qid).trim() !== ""
             ) {
-              appendQueryCellWithAshLinks(td, v, qid);
+              appendQueryCellWithAshLinks(td, v, qid, ashFamilyLinkOptions(row, ashCellOpts));
             } else {
               appendQueryCell(td, v);
             }
@@ -3273,16 +3415,19 @@
           if (col.key === "query") {
             applyMonoTableCellClass(td, col);
             const qid = row.query_id != null && row.query_id !== undefined ? row.query_id : row.queryid;
-            const stmtQid = statementRowAshQueryId(row);
-            if (pgssAshLinks && stmtQid != null) {
-              appendQueryCellWithAshLinks(td, v, stmtQid);
+            const stmtLink = statementRowAshLink(row);
+            if (pgssAshLinks && stmtLink != null) {
+              appendQueryCellWithAshLinks(td, v, stmtLink.queryId, {
+                canonicalize: stmtLink.canonicalize,
+                dbname: stmtLink.dbname,
+              });
             } else if (
               ashCellOpts &&
               ashCellOpts.ashQueryTextLinks &&
               qid != null &&
               String(qid).trim() !== ""
             ) {
-              appendQueryCellWithAshLinks(td, v, qid);
+              appendQueryCellWithAshLinks(td, v, qid, ashFamilyLinkOptions(row, ashCellOpts));
             } else {
               appendQueryCell(td, v);
             }
@@ -3908,6 +4053,78 @@
     return normalizeQueryTemplate(query);
   }
 
+  function canonicalStatementFamilyKey(source, template, dbname) {
+    return `${source}\0${template}\0${source === "ysql" ? String(dbname || "") : ""}`;
+  }
+
+  /**
+   * Snapshot-local query_id ↔ canonical-family index. YSQL families retain dbname because the
+   * statement Top 25 intentionally does not merge the same query shape across databases.
+   */
+  function buildCanonicalStatementFamilyIndex(doc) {
+    const families = new Map();
+    const byQueryId = new Map();
+
+    function addRows(source, rows) {
+      (rows || []).forEach((row) => {
+        const template = normalizeQueryTemplate(row.query);
+        const qid =
+          row.queryid != null && row.queryid !== undefined ? String(row.queryid).trim() : "";
+        if (!template || !qid) return;
+        const dbname =
+          source === "ysql" && row.dbname != null && String(row.dbname).trim() !== ""
+            ? String(row.dbname).trim()
+            : "";
+        const familyKey = canonicalStatementFamilyKey(source, template, dbname);
+        if (!families.has(familyKey)) {
+          families.set(familyKey, {
+            key: familyKey,
+            source,
+            template,
+            dbname: dbname || null,
+            queryIds: new Set(),
+            total_ms: 0,
+          });
+        }
+        const family = families.get(familyKey);
+        family.queryIds.add(qid);
+        family.total_ms += Number(row.total_ms) || 0;
+        if (!byQueryId.has(qid)) byQueryId.set(qid, []);
+        byQueryId.get(qid).push(family);
+      });
+    }
+
+    const pgPer = doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node;
+    const ycqlPer = doc && doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
+    addRows("ysql", pgPer ? mergeStatements(pgPer) : []);
+    addRows("ycql", ycqlPer ? mergeYcqlStatements(ycqlPer) : []);
+    return { families, byQueryId };
+  }
+
+  function resolveCanonicalStatementFamily(index, queryId, dbname) {
+    const qid = queryId != null ? String(queryId).trim() : "";
+    if (!qid || !index || !index.byQueryId) return null;
+    let candidates = (index.byQueryId.get(qid) || []).slice();
+    const wantedDb = dbname != null ? String(dbname).trim() : "";
+    if (wantedDb) {
+      const sameDb = candidates.filter(
+        (family) => family.source === "ysql" && String(family.dbname || "") === wantedDb
+      );
+      if (sameDb.length) candidates = sameDb;
+    }
+    candidates.sort((a, b) => (Number(b.total_ms) || 0) - (Number(a.total_ms) || 0));
+    return candidates[0] || null;
+  }
+
+  function statementRowMatchesCanonicalFamily(row, family) {
+    if (!row || !family) return false;
+    if (normalizeQueryTemplate(row.query) !== family.template) return false;
+    if (family.source !== "ysql") return true;
+    const dbname =
+      row.dbname != null && row.dbname !== undefined ? String(row.dbname).trim() : "";
+    return dbname === String(family.dbname || "");
+  }
+
   // --- Shared query-template grouping for the statement/ASH panels ------------------------------
   // These reuse queryTemplateKey (normalizeQueryTemplate when Merge similar SQL is on; kept
   // byte-identical to Python normalize_query_template) so a template collapses the same way in
@@ -4253,6 +4470,7 @@
       const queryMembers = members.map((r, i) => ({
         query_id: r.queryid != null && r.queryid !== undefined ? String(r.queryid) : "",
         query: r.query != null ? String(r.query) : "",
+        dbname: r.dbname != null && String(r.dbname).trim() !== "" ? String(r.dbname).trim() : null,
         calls: r.calls,
         tier: r.confidence_tier || "not_flagged",
         rank: i + 1,
@@ -4269,6 +4487,7 @@
         best_confidence_tier: best.confidence_tier || "not_flagged",
         queryids: queryMembers.map((m) => m.query_id),
         query_members: queryMembers,
+        dbname: best.dbname != null && String(best.dbname).trim() !== "" ? String(best.dbname).trim() : null,
         peak_counts: Array.from(peakSet).sort((a, b) => a - b),
         // Best member's full adjacent-pair list (display); ranges span every pair.
         peak_pairs: (best.peak_pairs || []).slice(),
@@ -4523,6 +4742,7 @@
         gap: histGapStr(r),
         query: mergeSimilarSql ? queryTemplateKey(r.query) || r.query : r.query,
         queryid: r.queryid,
+        dbname: r.dbname,
       }));
       const cols = [
         { key: "tier", label: "tier", type: "number", sortValue: (r) => HIST_TIER_RANK[r.tier] || 0 },
@@ -4549,7 +4769,11 @@
           displayRows,
           cols,
           "sec-latency-main",
-          { ashQueryTextLinks: true, ashQueryIdLinks: true }
+          {
+            ashQueryTextLinks: true,
+            ashQueryIdLinks: true,
+            canonicalizeFamily: !!mergeSimilarSql,
+          }
         )
       );
 
@@ -4560,7 +4784,9 @@
           members: g.member_count,
           peaks: (g.peak_counts || []).join(",") || "",
           gap: histGapStr(g),
-          template: g.template,
+          query: g.template,
+          queryid: (g.queryids && g.queryids[0]) || null,
+          dbname: g.dbname || (g.query_members && g.query_members[0] && g.query_members[0].dbname) || null,
           query_members: g.query_members,
         }));
         const grpCols = [
@@ -4572,7 +4798,7 @@
           },
           { key: "peaks", label: "peaks" },
           { key: "gap", label: "gap" },
-          { key: "template", label: "canonical query" },
+          { key: "query", label: "canonical query" },
           { key: "query_members", label: "member queryids (ranked)", sortable: false },
         ];
         groupHolder.appendChild(
@@ -4580,7 +4806,8 @@
             `Recurring query templates (${recurring.length})`,
             grpRows,
             grpCols,
-            "sec-latency-groups"
+            "sec-latency-groups",
+            { ashQueryTextLinks: true, canonicalizeFamily: true }
           )
         );
       }
@@ -4620,6 +4847,7 @@
     const ycqlSt = doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
     const ash = doc.yb_active_session_history && doc.yb_active_session_history.per_node;
     const topo = doc.node_topology || {};
+    const canonicalFamilyIndex = buildCanonicalStatementFamilyIndex(doc);
 
     const panelPgss = el("div", {
       className: "app-panel",
@@ -4926,9 +5154,21 @@
       const qF = ashQueryIdFilter;
       const nodeF = ashNodeIdFilter;
       const tableF = ashTableIdFilter;
+      const canonicalFamily =
+        qF && ashCanonicalizeFilter
+          ? resolveCanonicalStatementFamily(
+              canonicalFamilyIndex,
+              qF,
+              ashCanonicalDbnameFilter
+            )
+          : null;
       let ashData = ash;
       if (nodeF) ashData = filterAshPerNodeByNodeId(ashData, nodeF);
-      if (qF) ashData = filterAshPerNodeByQueryId(ashData, qF);
+      if (qF) {
+        ashData = canonicalFamily
+          ? filterAshPerNodeByCanonicalFamily(ashData, canonicalFamily)
+          : filterAshPerNodeByQueryId(ashData, qF);
+      }
       if (tableF) ashData = filterAshPerNodeByTableId(ashData, tableF);
 
       if (nodeF) {
@@ -5004,12 +5244,16 @@
         panelAsh.appendChild(bn);
       }
       if (qF) {
-        const qRaw = getQueryTextForToolbar(doc, qF);
+        const qRaw = canonicalFamily ? canonicalFamily.template : getQueryTextForToolbar(doc, qF);
         const qText =
           qRaw != null && String(qRaw).trim() !== "" ? String(qRaw).trim() : "";
         const note = el("div", { className: "ash-mode-banner ash-mode-banner--scoped" });
-        let ashQueryTitle = `query_id=${qF}`;
-        if (st) {
+        let ashQueryTitle = canonicalFamily
+          ? `canonical family (${canonicalFamily.queryIds.size} query_ids); representative query_id=${qF}`
+          : `query_id=${qF}`;
+        if (canonicalFamily && canonicalFamily.dbname) {
+          ashQueryTitle += `; dbname=${canonicalFamily.dbname}`;
+        } else if (st) {
           const rowDb = mergedStatementRowForQuery(st, mergeStatements, qF);
           if (rowDb && rowDb.dbname) ashQueryTitle += `; dbname=${rowDb.dbname}`;
         }
@@ -5020,7 +5264,12 @@
           })
         );
         const row = el("div", { className: "ash-mode-banner-query-row" });
-        row.appendChild(el("span", { className: "ash-mode-banner-query-k", textContent: "query" }));
+        row.appendChild(
+          el("span", {
+            className: "ash-mode-banner-query-k",
+            textContent: canonicalFamily ? "canonical query" : "query",
+          })
+        );
         row.appendChild(
           el("span", {
             className: qText
@@ -5030,7 +5279,7 @@
           })
         );
         note.appendChild(row);
-        appendAshScopedQueryStatementLines(note, doc, prevDoc, qF, ash);
+        appendAshScopedQueryStatementLines(note, doc, prevDoc, qF, ash, canonicalFamily);
         panelAsh.appendChild(note);
       }
       const ashClusterNodes = ashSnapshotClusterNodeCount(doc, ash);
@@ -5079,7 +5328,11 @@
       const ashMainColsAll = tableF
         ? ashMainColsBase.filter((c) => c.key !== "namespace_name" && c.key !== "object_name")
         : ashMainColsBase;
-      const ashMainColsStripped = qF ? ashColumnsWithoutQueryIdAndQuery(ashMainColsAll) : ashMainColsAll;
+      const ashMainColsStripped = qF
+        ? canonicalFamily
+          ? ashColumnsWithoutQuery(ashMainColsAll)
+          : ashColumnsWithoutQueryIdAndQuery(ashMainColsAll)
+        : ashMainColsAll;
       const ashMainCols = spliceAshNodeLoadDistributionColumn(
         ashMainColsStripped,
         ashClusterNodes,
@@ -5133,7 +5386,9 @@
 
       {
         const ashMainTop50GroupLabel = qF
-          ? "Table/Index + Wait_Event"
+          ? canonicalFamily
+            ? "Table/Index + Canonical Query + Wait_Event"
+            : "Table/Index + Wait_Event"
           : tableF
           ? mergeSimilarSql
             ? "Canonical Query + Wait_Event"
@@ -5268,7 +5523,9 @@
           ashShowNodeLoadDist
         );
         let byNsObjQueryCols = qF
-          ? ashColumnsWithoutQueryIdAndQuery(byNsObjQueryColsAll)
+          ? canonicalFamily
+            ? ashColumnsWithoutQuery(byNsObjQueryColsAll)
+            : ashColumnsWithoutQueryIdAndQuery(byNsObjQueryColsAll)
           : byNsObjQueryColsAll;
         panelAsh.appendChild(
           buildSortableTable(
