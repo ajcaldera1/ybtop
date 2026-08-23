@@ -4440,9 +4440,8 @@
     chk.checked = !!mergeSimilarSql;
     chk.addEventListener("change", () => {
       mergeSimilarSql = chk.checked;
-      if (mergeSimilarSqlSavedForFamily !== null) {
-        mergeSimilarSqlSavedForFamily = mergeSimilarSql;
-      }
+      // Family ASH still needs Merge on; do not record this click as the value to restore.
+      syncMergeSimilarSqlForFamilyScope();
       if (!mergeSimilarSql) {
         pgssShowRecurringTemplates = false;
         ycqlShowRecurringTemplates = false;
