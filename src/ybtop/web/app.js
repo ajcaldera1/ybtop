@@ -167,6 +167,8 @@
   let mergeSimilarSql = false;
   /** Prior Merge value while a canonical-family ASH URL forces grouping on; null when not held. */
   let mergeSimilarSqlSavedForFamily = null;
+  /** True only when this snapshot resolved a family for the canonicalize URL (not the URL flag alone). */
+  let canonicalFamilyResolved = false;
   /** Latency modes tab: include the dip_p column when true (browser-only UI preference). */
   let latencyShowDipP = true;
   /** Survive Merge similar SQL / full renderDoc rebuilds (same idea as latencyShowDipP). */
@@ -255,21 +257,30 @@
       ashCanonicalDbnameFilter = null;
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
+      canonicalFamilyResolved = false;
     }
     syncMergeSimilarSqlForFamilyScope();
   }
 
   /**
-   * Family ASH URLs need Merge similar SQL on so grouping survives reload, but that must not
-   * stick after the user leaves the family view. Hold and restore the toggle they actually set.
+   * Pin Merge similar SQL only while a canonical family actually resolved in this snapshot.
+   * `canonicalize=t` stays in the URL across Prev/Next so a later window can still resolve;
+   * a miss must not leave Merge stuck on with no control on screen.
    */
   function syncMergeSimilarSqlForFamilyScope() {
-    if (ashCanonicalizeFilter) {
+    const familyActive = !!(ashCanonicalizeFilter && canonicalFamilyResolved);
+    if (familyActive) {
       if (mergeSimilarSqlSavedForFamily === null) {
         mergeSimilarSqlSavedForFamily = mergeSimilarSql;
       }
       mergeSimilarSql = true;
-    } else if (mergeSimilarSqlSavedForFamily !== null) {
+      return;
+    }
+    if (ashCanonicalizeFilter && mergeSimilarSqlSavedForFamily !== null) {
+      mergeSimilarSql = mergeSimilarSqlSavedForFamily;
+      return;
+    }
+    if (mergeSimilarSqlSavedForFamily !== null) {
       mergeSimilarSql = mergeSimilarSqlSavedForFamily;
       mergeSimilarSqlSavedForFamily = null;
     }
@@ -325,6 +336,7 @@
       ashCanonicalDbnameFilter = null;
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
+      canonicalFamilyResolved = false;
     }
     syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = id;
@@ -1774,6 +1786,7 @@
     ashCanonicalizeFilter = false;
     ashCanonicalDbnameFilter = null;
     ashTableIdFilter = null;
+    canonicalFamilyResolved = false;
     syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
@@ -1790,6 +1803,7 @@
     ashCanonicalizeFilter = false;
     ashCanonicalDbnameFilter = null;
     ashNodeIdFilter = null;
+    canonicalFamilyResolved = false;
     syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
@@ -4870,6 +4884,16 @@
     const ash = doc.yb_active_session_history && doc.yb_active_session_history.per_node;
     const topo = doc.node_topology || {};
     const canonicalFamilyIndex = buildCanonicalStatementFamilyIndex(doc);
+    const canonicalFamily =
+      ashQueryIdFilter && ashCanonicalizeFilter
+        ? resolveCanonicalStatementFamily(
+            canonicalFamilyIndex,
+            ashQueryIdFilter,
+            ashCanonicalDbnameFilter
+          )
+        : null;
+    canonicalFamilyResolved = !!canonicalFamily;
+    syncMergeSimilarSqlForFamilyScope();
 
     const panelPgss = el("div", {
       className: "app-panel",
@@ -5179,14 +5203,6 @@
       const qF = ashQueryIdFilter;
       const nodeF = ashNodeIdFilter;
       const tableF = ashTableIdFilter;
-      const canonicalFamily =
-        qF && ashCanonicalizeFilter
-          ? resolveCanonicalStatementFamily(
-              canonicalFamilyIndex,
-              qF,
-              ashCanonicalDbnameFilter
-            )
-          : null;
       let ashData = ash;
       if (nodeF) ashData = filterAshPerNodeByNodeId(ashData, nodeF);
       if (qF) {
