@@ -4350,7 +4350,7 @@
   /** Columns for a template-collapsed statement table: drop per-statement id, keep dbname. */
   function groupedStatementDisplayColumns(baseCols) {
     return relabelQueryColumn(
-      (baseCols || []).filter((c) => c.key !== "queryid" && c.key !== "tmpl"),
+      (baseCols || []).filter((c) => c.key !== "queryid"),
       "canonical query"
     );
   }
@@ -4475,10 +4475,6 @@
         const bcDiff = (b.bc || 0) - (a.bc || 0);
         if (bcDiff) return bcDiff;
         return String(a.queryid).localeCompare(String(b.queryid));
-      });
-      members.forEach((r, i) => {
-        r.template_rank = i + 1;
-        r.template_member_count = members.length;
       });
       const best = members[0];
       const peakSet = new Set();
@@ -4808,7 +4804,6 @@
       if (latencyShowRecurringTemplates && recurring.length) {
         const grpRows = recurring.map((g) => ({
           best_tier: g.best_confidence_tier,
-          members: g.member_count,
           peaks: (g.peak_counts || []).join(",") || "",
           gap: histGapStr(g),
           query: g.template,
@@ -5408,7 +5403,7 @@
               ashTemplateSummary,
               ashTemplateSummaryCols,
               "sec-ash-templates",
-              ashReportCellOpts
+              Object.assign({}, ashReportCellOpts, { canonicalizeFamily: true })
             )
           );
         }
