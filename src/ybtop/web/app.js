@@ -264,8 +264,9 @@
 
   /**
    * Pin Merge similar SQL only while a canonical family actually resolved in this snapshot.
-   * `canonicalize=t` stays in the URL across Prev/Next so a later window can still resolve;
-   * a miss must not leave Merge stuck on with no control on screen.
+   * `canonicalize=t` stays in the URL across Prev/Next so a later window can still resolve.
+   * A miss (or leaving ASH) restores the held preference once; the next resolved family
+   * captures Merge again.
    */
   function syncMergeSimilarSqlForFamilyScope() {
     const familyActive = !!(ashCanonicalizeFilter && canonicalFamilyResolved);
@@ -274,10 +275,6 @@
         mergeSimilarSqlSavedForFamily = mergeSimilarSql;
       }
       mergeSimilarSql = true;
-      return;
-    }
-    if (ashCanonicalizeFilter && mergeSimilarSqlSavedForFamily !== null) {
-      mergeSimilarSql = mergeSimilarSqlSavedForFamily;
       return;
     }
     if (mergeSimilarSqlSavedForFamily !== null) {
@@ -1937,8 +1934,10 @@
   }
 
   /**
-   * @param {boolean} [useMergeBucketScan] — Top-level merged ASH rows: scan flat rows by `ash_merge_key` ==
-   *   `ash_flat_bucket_key` (avoids Map lookup / key recomputation mismatches). Other rollups keep false.
+   * @param {boolean} [useMergeBucketScan] — Scan flat rows by `ash_merge_key` == `ash_flat_bucket_key`.
+   *   Only pass true when the merged rows are keyed by `ashMergeKey` (Merge similar SQL off).
+   *   Canonical Top 50 keys (`ashMergeKeyCanonical`) never equal `ash_flat_bucket_key`; other
+   *   rollups keep false.
    */
   function attachAshNodeLoadDistribution(rows, flatRows, bucketKeyFn, enabled, useMergeBucketScan) {
     if (!enabled || !rows || !flatRows || typeof bucketKeyFn !== "function") return rows || [];
@@ -4571,8 +4570,9 @@
       if (!res.calls) res.calls = r.calls;
       return res;
     });
-    // Ranking and template grouping are deferred to the panel so they run over the
-    // currently-displayed (filtered) rows, matching the Python report ordering.
+    // Ranking and template grouping happen in the panel: groups use the full analyzed
+    // set so "best" ranks stay stable under min-tier / flagged-only; the table is then
+    // re-ranked among the visible rows (that visible re-rank matches the Python report).
     return { mode, results, source: "browser" };
   }
 
