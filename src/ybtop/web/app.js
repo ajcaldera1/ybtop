@@ -4151,9 +4151,8 @@
   }
 
   // --- Shared query-template grouping for the statement/ASH panels ------------------------------
-  // These reuse queryTemplateKey (normalizeQueryTemplate when Merge similar SQL is on; kept
-  // byte-identical to Python normalize_query_template) so a template collapses the same way in
-  // every panel and in the CLI when merging is enabled.
+  // These reuse queryTemplateKey (normalizeQueryTemplate when Merge similar SQL is on). The
+  // browser and CLI use the same rules, so a template collapses the same way in every panel.
 
   /**
    * Collapse merged statement rows (pg_stat / ycql shape, carrying `_deltaSrc`) into one row per
@@ -4306,6 +4305,8 @@
         const row = {
           query_template: g.query_template,
           template: g.template,
+          query: g.template,
+          queryid: queryMembers.length ? queryMembers[0].query_id : null,
           members: queryMembers.length,
           calls: g.calls,
           calls_per_sec: Math.round(g.calls_per_sec * 100) / 100,
@@ -4340,7 +4341,7 @@
       cols.push({ key: "dbname", label: "dbname" });
     }
     cols.push(
-      { key: "template", label: "canonical query" },
+      { key: "query", label: "canonical query" },
       { key: "query_members", label: "member queryids (ranked)", sortable: false }
     );
     return cols;
@@ -4986,7 +4987,7 @@
               dbname: pgSummary.some((r) => Object.prototype.hasOwnProperty.call(r, "dbname")),
             }),
             "sec-pgss-templates",
-            undefined,
+            { ashQueryTextLinks: true, canonicalizeFamily: true },
             STATEMENT_TEMPLATE_SUMMARY_SORT
           )
         );
@@ -5116,7 +5117,7 @@
             ycqlSummary,
             statementTemplateSummaryColumns({ callsPerSec: isDelta }),
             "sec-ycql-templates",
-            undefined,
+            { ashQueryTextLinks: true, canonicalizeFamily: true },
             STATEMENT_TEMPLATE_SUMMARY_SORT
           )
         );
@@ -5383,6 +5384,7 @@
         ashObjectLinks: true,
         ashQueryIdLinks: true,
         ashQueryTextLinks: true,
+        canonicalizeFamily: !!mergeSimilarSql,
       };
       const ashPaginatedOpts = { ashCellOpts: ashReportCellOpts };
       // Sort columns (Active Sessions/sec, Load %) stay on the left; canonical query and ranked
