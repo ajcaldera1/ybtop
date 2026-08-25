@@ -145,11 +145,35 @@
   let activeViewerSection = "pgss";
   /** ASH filters from URL / deeplinks; cleared when leaving the ASH tab. */
   let ashQueryIdFilter = null;
+  /** Expand ashQueryIdFilter to every statement in its canonical-query family. */
+  let ashCanonicalizeFilter = false;
+  /** YSQL canonical families are database-scoped; null lets direct URLs pick the dominant match. */
+  let ashCanonicalDbnameFilter = null;
   let ashNodeIdFilter = null;
   let ashTableIdFilter = null;
 
+  /**
+   * Recurring-template visibility (per panel). Flipping a toggle re-renders from the retained snapshot.
+   */
+  let pgssShowRecurringTemplates = false;
+  let ycqlShowRecurringTemplates = false;
+  let ashShowRecurringTemplates = false;
+  let latencyShowRecurringTemplates = false;
+  /**
+   * Viewer-wide: when true, query templates collapse IN-lists, VALUES row-lists, $N binds,
+   * and per-call comments via normalizeQueryTemplate. When false, each distinct SQL string is its
+   * own template key (whitespace trimmed only).
+   */
+  let mergeSimilarSql = false;
+  /** Prior Merge value while a canonical-family ASH URL forces grouping on; null when not held. */
+  let mergeSimilarSqlSavedForFamily = null;
+  /** True only when this snapshot resolved a family for the canonicalize URL (not the URL flag alone). */
+  let canonicalFamilyResolved = false;
   /** Latency modes tab: include the dip_p column when true (browser-only UI preference). */
   let latencyShowDipP = true;
+  /** Survive Merge similar SQL / full renderDoc rebuilds (same idea as latencyShowDipP). */
+  let latencyMinTier = "high";
+  let latencyFlaggedOnly = false;
 
   const VIEWER_SECTION_IDS = ["pgss", "ycql", "ash", "tablets", "latency"];
 
@@ -214,14 +238,48 @@
     }
     const q = p.get("query");
     ashQueryIdFilter = q != null && String(q) !== "" ? String(q) : null;
+    const canonicalize = p.get("canonicalize");
+    ashCanonicalizeFilter =
+      ashQueryIdFilter != null &&
+      (canonicalize === "t" || canonicalize === "true" || canonicalize === "1");
+    const dbname = p.get("dbname");
+    ashCanonicalDbnameFilter =
+      ashCanonicalizeFilter && dbname != null && String(dbname).trim() !== ""
+        ? String(dbname).trim()
+        : null;
     const n = p.get("node");
     ashNodeIdFilter = n != null && String(n).trim() !== "" ? String(n).trim() : null;
     const tb = p.get("table_id");
     ashTableIdFilter = tb != null && String(tb).trim() !== "" ? String(tb).trim() : null;
     if (activeViewerSection !== "ash") {
       ashQueryIdFilter = null;
+      ashCanonicalizeFilter = false;
+      ashCanonicalDbnameFilter = null;
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
+      canonicalFamilyResolved = false;
+    }
+    syncMergeSimilarSqlForFamilyScope();
+  }
+
+  /**
+   * Pin Merge similar SQL only while a canonical family actually resolved in this snapshot.
+   * `canonicalize=t` stays in the URL across Prev/Next so a later window can still resolve.
+   * A miss (or leaving ASH) restores the held preference once; the next resolved family
+   * captures Merge again.
+   */
+  function syncMergeSimilarSqlForFamilyScope() {
+    const familyActive = !!(ashCanonicalizeFilter && canonicalFamilyResolved);
+    if (familyActive) {
+      if (mergeSimilarSqlSavedForFamily === null) {
+        mergeSimilarSqlSavedForFamily = mergeSimilarSql;
+      }
+      mergeSimilarSql = true;
+      return;
+    }
+    if (mergeSimilarSqlSavedForFamily !== null) {
+      mergeSimilarSql = mergeSimilarSqlSavedForFamily;
+      mergeSimilarSqlSavedForFamily = null;
     }
   }
 
@@ -239,6 +297,10 @@
     if (windowKey) p.set("t", windowKey);
     if (activeViewerSection === "ash") {
       if (ashQueryIdFilter) p.set("query", ashQueryIdFilter);
+      if (ashQueryIdFilter && ashCanonicalizeFilter) {
+        p.set("canonicalize", "t");
+        if (ashCanonicalDbnameFilter) p.set("dbname", ashCanonicalDbnameFilter);
+      }
       if (ashNodeIdFilter) p.set("node", ashNodeIdFilter);
       if (ashTableIdFilter) p.set("table_id", ashTableIdFilter);
     }
@@ -249,6 +311,8 @@
       view: activeViewerSection,
       t: windowKey,
       query: ashQueryIdFilter || null,
+      canonicalize: ashCanonicalizeFilter || false,
+      dbname: ashCanonicalDbnameFilter || null,
       node: ashNodeIdFilter || null,
       table_id: ashTableIdFilter || null,
     };
@@ -265,9 +329,13 @@
       !!ashQueryIdFilter || !!ashNodeIdFilter || !!ashTableIdFilter;
     if (id !== "ash") {
       ashQueryIdFilter = null;
+      ashCanonicalizeFilter = false;
+      ashCanonicalDbnameFilter = null;
       ashNodeIdFilter = null;
       ashTableIdFilter = null;
+      canonicalFamilyResolved = false;
     }
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = id;
     const app = document.getElementById("app");
     if (!app) return;
@@ -554,9 +622,15 @@
    * Sum `calls` on one node for a merged statement row.
    * YSQL: queryid + dbname; YCQL: queryid only.
    */
-  function statementCallsOnNodeMatching(perNode, nodeId, stmtRow, matchDbname) {
+  function statementCallsOnNodeMatching(
+    perNode,
+    nodeId,
+    stmtRow,
+    matchDbname,
+    canonicalFamily
+  ) {
     const wantQ = normQid(stmtRow.queryid);
-    if (wantQ == null) return 0;
+    if (wantQ == null && !canonicalFamily) return 0;
     const dn =
       matchDbname && stmtRow.dbname != null && stmtRow.dbname !== undefined
         ? String(stmtRow.dbname).trim()
@@ -565,7 +639,11 @@
     const rows = (perNode || {})[nid] || [];
     let sum = 0;
     rows.forEach((r) => {
-      if (normQid(r.queryid) !== wantQ) return;
+      if (canonicalFamily) {
+        if (!statementRowMatchesCanonicalFamily(r, canonicalFamily)) return;
+      } else if (normQid(r.queryid) !== wantQ) {
+        return;
+      }
       if (matchDbname) {
         const rdn = r.dbname != null && r.dbname !== undefined ? String(r.dbname).trim() : "";
         if (rdn !== dn) return;
@@ -579,17 +657,36 @@
    * Per-node positive contributions for the scoped statement: cumulative calls, or Δcalls vs prior when deltaMode.
    * Same “positive weights only” split as ASH load distribution (summarizeAshNodeLoadPct).
    */
-  function statementCallsContributorsPerNodeMap(perNode, stmtRow, prevPerNode, deltaMode, matchDbname) {
+  function statementCallsContributorsPerNodeMap(
+    perNode,
+    stmtRow,
+    prevPerNode,
+    deltaMode,
+    matchDbname,
+    canonicalFamily
+  ) {
     const keys = new Set(Object.keys(perNode || {}));
     if (deltaMode && prevPerNode) {
       Object.keys(prevPerNode).forEach((k) => keys.add(k));
     }
     const nm = new Map();
     keys.forEach((nid) => {
-      const cur = statementCallsOnNodeMatching(perNode, nid, stmtRow, matchDbname);
+      const cur = statementCallsOnNodeMatching(
+        perNode,
+        nid,
+        stmtRow,
+        matchDbname,
+        canonicalFamily
+      );
       let metric = cur;
       if (deltaMode && prevPerNode) {
-        const prev = statementCallsOnNodeMatching(prevPerNode, nid, stmtRow, matchDbname);
+        const prev = statementCallsOnNodeMatching(
+          prevPerNode,
+          nid,
+          stmtRow,
+          matchDbname,
+          canonicalFamily
+        );
         metric = cur - prev;
       }
       if (metric > 0) nm.set(String(nid), metric);
@@ -666,6 +763,7 @@
     if (want == null || !perNode) return false;
 
     const matchDbname = !!(opts && opts.matchDbname);
+    const canonicalFamily = opts && opts.canonicalFamily;
     const hasRowsCol = matchDbname && pgStatPerNodeHasRowsColumn(perNode);
 
     const merged = mergeFn(perNode);
@@ -674,15 +772,24 @@
     if (prevDoc && prevPerNode) {
       deltaMode = true;
       const mergedPrev = mergeFn(prevPerNode);
-      const deltaRows = deltaPgStatMergedRows(merged, mergedPrev);
+      const currentRows = canonicalFamily ? collapseStatementsByTemplate(merged) : merged;
+      const previousRows = canonicalFamily ? collapseStatementsByTemplate(mergedPrev) : mergedPrev;
+      const deltaRows = deltaPgStatMergedRows(currentRows, previousRows);
       const derived = withPgStatDeltaDerivedRows(
         deltaRows,
         prevDoc.generated_at_utc,
         doc.generated_at_utc
       );
-      stmtRow = pickMergedPgStatRowForQueryId(derived, qF);
+      stmtRow = canonicalFamily
+        ? derived.find((row) => statementRowMatchesCanonicalFamily(row, canonicalFamily)) || null
+        : pickMergedPgStatRowForQueryId(derived, qF);
     } else {
-      stmtRow = pickMergedPgStatRowForQueryId(withPgStatTimePercent(merged), qF);
+      const displayRows = withPgStatTimePercent(
+        canonicalFamily ? collapseStatementsByTemplate(merged) : merged
+      );
+      stmtRow = canonicalFamily
+        ? displayRows.find((row) => statementRowMatchesCanonicalFamily(row, canonicalFamily)) || null
+        : pickMergedPgStatRowForQueryId(displayRows, qF);
     }
 
     if (!stmtRow) {
@@ -710,7 +817,8 @@
       stmtRow,
       prevPerNode,
       deltaMode,
-      matchDbname
+      matchDbname,
+      canonicalFamily
     );
     const callsDist = summarizeAshNodeLoadPct(contribMap);
     appendAshBannerCallsDistributionRow(noteEl, clusterNodes, callsDist);
@@ -752,7 +860,14 @@
    * Statement summary under the ASH query banner: pg_stat_statements when present, else ycql_stat_statements.
    * @param ashPerNode ASH per_node map (unfiltered) for cluster node count only.
    */
-  function appendAshScopedQueryStatementLines(noteEl, doc, prevDoc, qF, ashPerNode) {
+  function appendAshScopedQueryStatementLines(
+    noteEl,
+    doc,
+    prevDoc,
+    qF,
+    ashPerNode,
+    canonicalFamily
+  ) {
     const pgPer = doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node;
     const ycqlPer = doc && doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
     const prevPg =
@@ -760,8 +875,16 @@
     const prevYcql =
       prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
 
-    const inPg = mergedStatementRowForQuery(pgPer, mergeStatements, qF);
-    const inYcql = mergedStatementRowForQuery(ycqlPer, mergeYcqlStatements, qF);
+    const inPg = canonicalFamily
+      ? canonicalFamily.source === "ysql"
+        ? canonicalFamily
+        : null
+      : mergedStatementRowForQuery(pgPer, mergeStatements, qF);
+    const inYcql = canonicalFamily
+      ? canonicalFamily.source === "ycql"
+        ? canonicalFamily
+        : null
+      : mergedStatementRowForQuery(ycqlPer, mergeYcqlStatements, qF);
 
     if (inPg) {
       if (
@@ -775,7 +898,7 @@
           pgPer,
           prevPg,
           mergeStatements,
-          { matchDbname: true }
+          { matchDbname: true, canonicalFamily }
         )
       ) {
         ashBannerMetricRow(
@@ -798,7 +921,7 @@
           ycqlPer,
           prevYcql,
           mergeYcqlStatements,
-          { matchDbname: false, showIsPrepared: true }
+          { matchDbname: false, showIsPrepared: true, canonicalFamily }
         )
       ) {
         ashBannerMetricRow(
@@ -1188,6 +1311,38 @@
     return disp != null ? String(disp) : "";
   }
 
+  /**
+   * Query text used as an ASH grouping dimension. With Merge similar SQL on this is the
+   * normalized template so IN/VALUES/bind variants collapse; otherwise the raw snapshot text.
+   */
+  function ashQueryGroupText(query) {
+    if (!mergeSimilarSql) {
+      return query != null && query !== undefined ? String(query) : "";
+    }
+    const key = queryTemplateKey(query);
+    return key || (query != null && query !== undefined ? String(query) : "");
+  }
+
+  function ashQueryColumnLabel() {
+    return mergeSimilarSql ? "canonical query" : "query";
+  }
+
+  /**
+   * Grouping identity for query text. Resolved SQL uses ashQueryGroupText (canonical when Merge
+   * is on, raw otherwise). With Merge on, unresolved rows fall back to query_id so distinct
+   * DocDB/YCQL/evicted ids do not collapse into one bucket; with Merge off they stay one
+   * empty-text bucket, matching the pre-merge rollups.
+   */
+  function ashCanonicalGroupKey(r) {
+    const q = ashQueryGroupText(r.query);
+    if (q) return q;
+    if (mergeSimilarSql) {
+      const qid = normQid(r.query_id);
+      if (qid != null && String(qid).trim() !== "") return `\0qid:${String(qid)}`;
+    }
+    return "\0__no_query__";
+  }
+
   /** Group ASH rows by displayed object identity + resolved table_id (many aux values share one tablet/table). */
   function ashMergeKey(r) {
     return [
@@ -1198,6 +1353,76 @@
       ashMergeTableKey(r),
       r.ysql_dbid == null ? "" : String(r.ysql_dbid),
     ].join("\0");
+  }
+
+  /** Top-50 merge key when Merge similar SQL is on: table/index + canonical query + wait event. */
+  function ashMergeKeyCanonical(r) {
+    return [
+      ashCanonicalGroupKey(r),
+      r.wait_event_component,
+      r.wait_event,
+      r.wait_event_type,
+      ashMergeTableKey(r),
+      r.ysql_dbid == null ? "" : String(r.ysql_dbid),
+    ].join("\0");
+  }
+
+  /** Collapse query_id-merged ASH rows onto the canonical-query Top 50 identity. */
+  function collapseAshMergedByCanonicalQuery(rows) {
+    const m = new Map();
+    (rows || []).forEach((r) => {
+      const k = ashMergeKeyCanonical(r);
+      const q = ashQueryGroupText(r.query);
+      if (!m.has(k)) {
+        m.set(k, {
+          ash_merge_key: k,
+          query_id: r.query_id,
+          wait_event_component: r.wait_event_component,
+          wait_event: r.wait_event,
+          wait_event_type: r.wait_event_type,
+          wait_event_aux: r.wait_event_aux,
+          ysql_dbid: r.ysql_dbid != null && r.ysql_dbid !== undefined ? r.ysql_dbid : null,
+          namespace_name: r.namespace_name != null ? r.namespace_name : null,
+          object_name: r.object_name != null ? r.object_name : null,
+          table_id: r.table_id != null && r.table_id !== undefined ? r.table_id : null,
+          samples: 0,
+          query: q,
+          _best_samples: 0,
+        });
+      }
+      const ent = m.get(k);
+      const add = Number(r.samples) || 0;
+      ent.samples += add;
+      if (
+        q &&
+        add > ent._best_samples &&
+        r.query_id != null &&
+        String(r.query_id).trim() !== ""
+      ) {
+        ent.query_id = r.query_id;
+        ent._best_samples = add;
+      }
+      if (!ent.query && q) ent.query = q;
+      ent.namespace_name = ent.namespace_name || r.namespace_name || null;
+      ent.object_name = ent.object_name || r.object_name || null;
+      if (
+        (ent.table_id == null || ent.table_id === "") &&
+        r.table_id != null &&
+        String(r.table_id).trim() !== ""
+      ) {
+        ent.table_id = r.table_id;
+      }
+      if (ent.ysql_dbid == null && r.ysql_dbid != null && r.ysql_dbid !== undefined) {
+        ent.ysql_dbid = r.ysql_dbid;
+      }
+    });
+    const out = Array.from(m.values()).map((ent) => {
+      const rest = Object.assign({}, ent);
+      delete rest._best_samples;
+      return Object.assign({}, rest, { object_name: ashDisplayObjectName(rest) });
+    });
+    out.sort((a, b) => b.samples - a.samples);
+    return out;
   }
 
   function mergeAsh(perNode) {
@@ -1267,6 +1492,19 @@
     const out = {};
     Object.keys(perNode || {}).forEach((nid) => {
       const rows = (perNode[nid] || []).filter((r) => rowMatchesAshQueryIdFilter(r, want));
+      if (rows.length) out[nid] = rows;
+    });
+    return out;
+  }
+
+  function filterAshPerNodeByCanonicalFamily(perNode, family) {
+    if (!family || !family.queryIds || !family.queryIds.size) return perNode;
+    const wanted = Array.from(family.queryIds);
+    const out = {};
+    Object.keys(perNode || {}).forEach((nid) => {
+      const rows = (perNode[nid] || []).filter((r) =>
+        wanted.some((qid) => rowMatchesAshQueryIdFilter(r, qid))
+      );
       if (rows.length) out[nid] = rows;
     });
     return out;
@@ -1472,11 +1710,34 @@
     return cols.filter((c) => c.key !== "query_id" && c.key !== "query");
   }
 
-  function buildAshQueryHref(qid) {
+  /** Canonical-family scope keeps the representative query_id but hides repeated canonical SQL. */
+  function ashColumnsWithoutQuery(cols) {
+    return cols
+      .filter((c) => c.key !== "query")
+      .map((c) =>
+        c.key === "query_id" ? Object.assign({}, c, { label: "representative query_id" }) : c
+      );
+  }
+
+  function buildAshQueryHref(qid, options) {
+    const opts = options || {};
     const p = new URLSearchParams();
     p.set("view", "ash");
     p.set("query", String(qid));
+    if (opts.canonicalize) {
+      p.set("canonicalize", "t");
+      if (opts.dbname != null && String(opts.dbname).trim() !== "") {
+        p.set("dbname", String(opts.dbname).trim());
+      }
+    }
     return `${window.location.pathname}?${p.toString()}`;
+  }
+
+  /** When a table opts into family drilldowns, query-text links expand the canonical family. */
+  function ashFamilyLinkOptions(row, cellOpts) {
+    if (!cellOpts || !cellOpts.canonicalizeFamily) return {};
+    const dbname = row && row.dbname != null ? row.dbname : null;
+    return { canonicalize: true, dbname: dbname };
   }
 
   function buildAshNodeHref(nodeId) {
@@ -1493,12 +1754,19 @@
     return `${window.location.pathname}?${p.toString()}`;
   }
 
-  function navigateToAshForQueryId(qid) {
+  function navigateToAshForQueryId(qid, options) {
+    const opts = options || {};
     const s = String(qid).trim();
     if (!s) return;
     ashQueryIdFilter = s;
+    ashCanonicalizeFilter = !!opts.canonicalize;
+    ashCanonicalDbnameFilter =
+      ashCanonicalizeFilter && opts.dbname != null && String(opts.dbname).trim() !== ""
+        ? String(opts.dbname).trim()
+        : null;
     ashNodeIdFilter = null;
     ashTableIdFilter = null;
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     /* pushState so the browser Back button returns to the prior tab (e.g. statements). */
     writeViewerStateToUrl({ push: true });
@@ -1512,7 +1780,11 @@
     if (!s) return;
     ashNodeIdFilter = s;
     ashQueryIdFilter = null;
+    ashCanonicalizeFilter = false;
+    ashCanonicalDbnameFilter = null;
     ashTableIdFilter = null;
+    canonicalFamilyResolved = false;
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
     if (lastDoc) {
@@ -1525,7 +1797,11 @@
     if (!s) return;
     ashTableIdFilter = s;
     ashQueryIdFilter = null;
+    ashCanonicalizeFilter = false;
+    ashCanonicalDbnameFilter = null;
     ashNodeIdFilter = null;
+    canonicalFamilyResolved = false;
+    syncMergeSimilarSqlForFamilyScope();
     activeViewerSection = "ash";
     writeViewerStateToUrl({ push: true });
     if (lastDoc) {
@@ -1658,8 +1934,10 @@
   }
 
   /**
-   * @param {boolean} [useMergeBucketScan] — Top-level merged ASH rows: scan flat rows by `ash_merge_key` ==
-   *   `ash_flat_bucket_key` (avoids Map lookup / key recomputation mismatches). Other rollups keep false.
+   * @param {boolean} [useMergeBucketScan] — Scan flat rows by `ash_merge_key` == `ash_flat_bucket_key`.
+   *   Only pass true when the merged rows are keyed by `ashMergeKey` (Merge similar SQL off).
+   *   Canonical Top 50 keys (`ashMergeKeyCanonical`) never equal `ash_flat_bucket_key`; other
+   *   rollups keep false.
    */
   function attachAshNodeLoadDistribution(rows, flatRows, bucketKeyFn, enabled, useMergeBucketScan) {
     if (!enabled || !rows || !flatRows || typeof bucketKeyFn !== "function") return rows || [];
@@ -1690,6 +1968,7 @@
   }
 
   function bucketKeyAshQueryIdFlat(r) {
+    if (mergeSimilarSql) return ashCanonicalGroupKey(r);
     const raw = r.query_id != null && r.query_id !== undefined ? r.query_id : null;
     return raw != null && String(raw).trim() !== "" ? String(raw).trim() : "\0__no_query_id__";
   }
@@ -1697,8 +1976,7 @@
   function bucketKeyAshNamespaceQueryFlat(r) {
     const nn =
       r.namespace_name != null && r.namespace_name !== undefined ? String(r.namespace_name) : "";
-    const q = r.query != null && r.query !== undefined ? String(r.query) : "";
-    return JSON.stringify([nn, q]);
+    return JSON.stringify([nn, ashCanonicalGroupKey(r)]);
   }
 
   function bucketKeyAshNsObjBucketFlat(r) {
@@ -1721,7 +1999,7 @@
         r.table_id != null && r.table_id !== undefined && String(r.table_id).trim() !== ""
           ? String(r.table_id).trim()
           : "";
-      const q = r.query != null && r.query !== undefined ? String(r.query) : "";
+      const q = ashCanonicalGroupKey(r);
       const dim = tid ? `tid:${tid}` : on;
       return ignoreQueryInKey ? JSON.stringify([nn, dim]) : JSON.stringify([nn, dim, q]);
     };
@@ -1761,23 +2039,42 @@
     const m = new Map();
     (rows || []).forEach((r) => {
       const nn = r.namespace_name != null && r.namespace_name !== undefined ? String(r.namespace_name) : "";
-      const q = r.query != null && r.query !== undefined ? String(r.query) : "";
-      const k = JSON.stringify([nn, q]);
+      const q = ashQueryGroupText(r.query);
+      const k = JSON.stringify([nn, ashCanonicalGroupKey(r)]);
       if (!m.has(k)) {
         m.set(k, {
           namespace_name: nn,
-          query_id: r.query_id != null && r.query_id !== undefined ? r.query_id : null,
+          query_id: null,
           query: q,
           samples: 0,
+          _best_samples: 0,
         });
       }
       const ent = m.get(k);
-      ent.samples += Number(r.samples) || 0;
-      if ((ent.query_id == null || ent.query_id === "") && r.query_id != null && r.query_id !== undefined) {
-        ent.query_id = r.query_id;
+      const add = Number(r.samples) || 0;
+      const raw = r.query_id != null && r.query_id !== undefined ? r.query_id : null;
+      ent.samples += add;
+      if ((!ent.query || ent.query === "") && q) ent.query = q;
+      // Heaviest member: resolvable SQL always; unresolved SQL only when Merge already
+      // keyed the bucket by query_id (so Load Distribution can recompute the same key).
+      // The shared empty-text bucket (Merge off) stays unstamped.
+      if (
+        (q || mergeSimilarSql) &&
+        add > (ent._best_samples || 0) &&
+        raw != null &&
+        String(raw).trim() !== ""
+      ) {
+        ent.query_id = raw;
+        ent._best_samples = add;
       }
     });
-    return Array.from(m.values()).sort((a, b) => b.samples - a.samples);
+    return Array.from(m.values())
+      .map((ent) => {
+        const row = Object.assign({}, ent);
+        delete row._best_samples;
+        return row;
+      })
+      .sort((a, b) => b.samples - a.samples);
   }
 
   /** Group merged ASH by pg_stat query id (query_id); sum samples. Rows without query_id bucket together. */
@@ -1785,25 +2082,46 @@
     const m = new Map();
     (rows || []).forEach((r) => {
       const raw = r.query_id != null && r.query_id !== undefined ? r.query_id : null;
-      const k =
-        raw != null && String(raw).trim() !== "" ? String(raw).trim() : "\0__no_query_id__";
+      const q = ashQueryGroupText(r.query);
+      const k = mergeSimilarSql
+        ? ashCanonicalGroupKey(r)
+        : raw != null && String(raw).trim() !== ""
+          ? String(raw).trim()
+          : "\0__no_query_id__";
       if (!m.has(k)) {
         m.set(k, {
-          query_id: k === "\0__no_query_id__" ? null : raw,
+          query_id: k === "\0__no_query_id__" || k === "\0__no_query__" ? null : raw,
           namespace_name:
             r.namespace_name != null && r.namespace_name !== undefined ? String(r.namespace_name) : "",
-          query: r.query != null && r.query !== undefined ? String(r.query) : "",
+          query: q,
           samples: 0,
         });
       }
       const ent = m.get(k);
-      ent.samples += Number(r.samples) || 0;
-      if ((!ent.query || ent.query === "") && r.query) ent.query = String(r.query);
+      const add = Number(r.samples) || 0;
+      ent.samples += add;
+      if ((!ent.query || ent.query === "") && q) ent.query = q;
       if ((!ent.namespace_name || ent.namespace_name === "") && r.namespace_name) {
         ent.namespace_name = String(r.namespace_name);
       }
+      if (
+        mergeSimilarSql &&
+        k !== "\0__no_query__" &&
+        add > (ent._best_samples || 0) &&
+        raw != null &&
+        String(raw).trim() !== ""
+      ) {
+        ent.query_id = raw;
+        ent._best_samples = add;
+      }
     });
-    return Array.from(m.values()).sort((a, b) => b.samples - a.samples);
+    return Array.from(m.values())
+      .map((ent) => {
+        const row = Object.assign({}, ent);
+        delete row._best_samples;
+        return row;
+      })
+      .sort((a, b) => b.samples - a.samples);
   }
 
   /**
@@ -1821,29 +2139,47 @@
         r.table_id != null && r.table_id !== undefined && String(r.table_id).trim() !== ""
           ? String(r.table_id).trim()
           : "";
-      const q = r.query != null && r.query !== undefined ? String(r.query) : "";
+      const q = ashQueryGroupText(r.query);
       const dim = tid ? `tid:${tid}` : on;
-      const k = ignoreQueryInKey ? JSON.stringify([nn, dim]) : JSON.stringify([nn, dim, q]);
+      const k = ignoreQueryInKey
+        ? JSON.stringify([nn, dim])
+        : JSON.stringify([nn, dim, ashCanonicalGroupKey(r)]);
       if (!m.has(k)) {
         m.set(k, {
           namespace_name: nn,
           object_name: on,
           table_id: tid || null,
           query: q,
-          query_id: r.query_id != null && r.query_id !== undefined ? r.query_id : null,
+          query_id: null,
           samples: 0,
+          _best_samples: 0,
         });
       }
       const ent = m.get(k);
-      ent.samples += Number(r.samples) || 0;
+      const add = Number(r.samples) || 0;
+      const raw = r.query_id != null && r.query_id !== undefined ? r.query_id : null;
+      ent.samples += add;
       if ((!ent.object_name || ent.object_name === "") && on) ent.object_name = on;
       if (!ent.table_id && tid) ent.table_id = tid;
       if ((!ent.query || ent.query === "") && q) ent.query = q;
-      if ((ent.query_id == null || ent.query_id === "") && r.query_id != null && r.query_id !== undefined) {
-        ent.query_id = r.query_id;
+      if (
+        (q || mergeSimilarSql) &&
+        add > (ent._best_samples || 0) &&
+        raw != null &&
+        String(raw).trim() !== ""
+      ) {
+        ent.query_id = raw;
+        if (q) ent.query = q;
+        ent._best_samples = add;
       }
     });
-    return Array.from(m.values()).sort((a, b) => b.samples - a.samples);
+    return Array.from(m.values())
+      .map((ent) => {
+        const row = Object.assign({}, ent);
+        delete row._best_samples;
+        return row;
+      })
+      .sort((a, b) => b.samples - a.samples);
   }
 
   /** Namespace × object/table buckets for Top-50 charts (groups by table_id when known). */
@@ -1885,6 +2221,30 @@
       ...r,
       load_pct: total > 0 ? Math.round(10000 * ((Number(r.samples) || 0) / total)) / 100 : 0,
     }));
+  }
+
+  /**
+   * Give each recurring-template member its share of the template's rates. Both metrics are linear
+   * in samples, so a proportional split is exact and lets the member list rank by whichever of
+   * Active Sessions/sec or Load % the table is sorted on.
+   */
+  function withAshTemplateMemberRates(rows) {
+    return (rows || []).map((r) => {
+      const members = r.query_members;
+      if (!members || !members.length) return r;
+      const total = Number(r.samples) || 0;
+      return {
+        ...r,
+        query_members: members.map((m) => {
+          const share = total > 0 ? (Number(m.samples) || 0) / total : 0;
+          return {
+            ...m,
+            sessions_per_sec: (Number(r.sessions_per_sec) || 0) * share,
+            load_pct: Math.round(10000 * ((Number(r.load_pct) || 0) * share)) / 10000,
+          };
+        }),
+      };
+    });
   }
 
   /** Half-open [ash_window.start_utc, ash_window.end_utc) length in seconds; min ~1e-9 to avoid div-by-zero. */
@@ -2103,6 +2463,8 @@
    */
   const MONO_TABLE_CELL_KEYS = new Set([
     "query",
+    "template",
+    "queryids",
     "queryid",
     "query_id",
     "namespace_name",
@@ -2133,6 +2495,104 @@
     if (key === "query" || MONO_TABLE_CELL_KEYS.has(key) || type === "number") {
       td.classList.add("yb-mono");
     }
+  }
+
+  /**
+   * Table sort key -> the member field that ranks the "member queryids (ranked)" list, so the
+   * ranking follows whichever metric column the user is sorting the template table by.
+   */
+  const TEMPLATE_MEMBER_RANK_FIELDS = {
+    calls: "calls",
+    calls_per_sec: "calls_per_sec",
+    total_ms: "total_ms",
+    time_pct: "total_ms",
+    samples: "samples",
+    sessions_per_sec: "sessions_per_sec",
+    load_pct: "load_pct",
+    best_tier: "tier",
+  };
+
+  /** Numeric value used to order members by `field` (tiers rank by severity, not alphabetically). */
+  function templateMemberRankValue(member, field) {
+    if (field === "tier") return HIST_TIER_RANK[member.tier] || 0;
+    return Number(member[field]) || 0;
+  }
+
+  /** Re-rank template members by the active sort column; falls back to the prebuilt order. */
+  function memberRankField(sortKey) {
+    return TEMPLATE_MEMBER_RANK_FIELDS[sortKey];
+  }
+
+  function orderTemplateMembers(members, sortKey, dir) {
+    const list = members || [];
+    const field = memberRankField(sortKey);
+    if (!field || !list.some((m) => m && m[field] != null && m[field] !== "")) return list;
+    const sign = dir === "asc" ? 1 : -1;
+    return list
+      .slice()
+      .sort((a, b) => {
+        const av = templateMemberRankValue(a, field);
+        const bv = templateMemberRankValue(b, field);
+        if (av !== bv) return (av - bv) * sign;
+        // Ties keep the list's build-time order (total time / samples / confidence) so equal
+        // members never shuffle between renders.
+        const ra = a.rank == null ? Infinity : Number(a.rank);
+        const rb = b.rank == null ? Infinity : Number(b.rank);
+        if (ra !== rb) return ra - rb;
+        return String(a.query_id).localeCompare(String(b.query_id));
+      })
+      .map((m, i) => Object.assign({}, m, { rank: i + 1 }));
+  }
+
+  function appendAshTemplateMembersCell(td, members, metricField) {
+    applyMonoTableCellClass(td, "queryids");
+    const list = el("div", { className: "tmpl-member-list" });
+    (members || []).forEach((member, i) => {
+      const row = el("div", { className: "tmpl-member-row" });
+      row.appendChild(
+        el("span", {
+          className: "tmpl-member-rank",
+          textContent: `${member.rank != null ? member.rank : i + 1}.`,
+        })
+      );
+      const qid = member.query_id;
+      const a = el("a", {
+        className: "ash-queryid-deeplink",
+        href: buildAshQueryHref(qid),
+        textContent: String(qid),
+        title: member.query ? String(member.query) : "Open query-scoped ASH",
+      });
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        navigateToAshForQueryId(qid);
+      });
+      row.appendChild(a);
+      // Show the metric the list is ranked by, so the parenthetical explains the ordering.
+      const order = metricField && member[metricField] != null && member[metricField] !== ""
+        ? [metricField]
+        : ["samples", "total_ms", "calls"];
+      let metric = "";
+      for (let k = 0; k < order.length && !metric; k += 1) {
+        const f = order[k];
+        const val = member[f];
+        if (val == null || val === "") continue;
+        if (f === "samples") metric = `(${Number(val) || 0} samples)`;
+        else if (f === "total_ms") metric = `(${formatPgStatMsTwoDecimals(val)} ms)`;
+        else if (f === "calls") metric = `(${Number(val) || 0} calls)`;
+        else if (f === "calls_per_sec") metric = `(${(Number(val) || 0).toFixed(2)} calls/s)`;
+        else if (f === "sessions_per_sec") metric = `(${formatAshSessionsPerSec(val)} sessions/s)`;
+        else if (f === "load_pct") metric = `(${(Number(val) || 0).toFixed(2)}% load)`;
+        else if (f === "tier") metric = `(${String(val)})`;
+      }
+      row.appendChild(
+        el("span", {
+          className: "tmpl-member-samples",
+          textContent: metric,
+        })
+      );
+      list.appendChild(row);
+    });
+    td.appendChild(list);
   }
 
   let _queryTipEl = null;
@@ -2505,17 +2965,35 @@
     td.appendChild(wrap);
   }
 
-  function appendQueryCellWithAshLinks(td, queryVal, qid) {
+  /** ASH link target for a statement row; collapsed rows open the whole canonical family. */
+  function statementRowAshLink(row) {
+    const primary = row && row._tmpl_primary_queryid;
+    if (primary != null && String(primary).trim() !== "") {
+      return {
+        queryId: primary,
+        canonicalize: true,
+        dbname: row.dbname != null ? row.dbname : null,
+      };
+    }
+    const qid = row && row.queryid;
+    if (qid != null && String(qid).trim() !== "" && !row._tmpl_member_count) {
+      return { queryId: qid, canonicalize: false, dbname: null };
+    }
+    return null;
+  }
+
+  function appendQueryCellWithAshLinks(td, queryVal, qid, options) {
+    const opts = options || {};
     const full = String(queryVal || "");
     const wrap = el("div", { className: "query-cell" });
     const a = el("a", {
       className: "query-preview query-ash-deeplink",
-      href: buildAshQueryHref(qid),
+      href: buildAshQueryHref(qid, opts),
       textContent: full,
     });
     a.addEventListener("click", (e) => {
       e.preventDefault();
-      navigateToAshForQueryId(qid);
+      navigateToAshForQueryId(qid, opts);
     });
     wrap.appendChild(a);
     const btn = el("button", {
@@ -2598,7 +3076,7 @@
     }
   }
 
-  function buildSortableTable(title, rows, columns, subsectionId, ashCellOpts) {
+  function buildSortableTable(title, rows, columns, subsectionId, ashCellOpts, initialSort) {
     const section = el("section", { className: "ybtop-section" });
     const body = el("div", { className: "section-body" });
     if (subsectionId) {
@@ -2621,7 +3099,13 @@
       body.appendChild(el("p", { textContent: "(no rows)" }));
       return section;
     }
-    const state = { key: columns[0].key, dir: "desc" };
+    const hasInitial =
+      initialSort &&
+      initialSort.key &&
+      columns.some((c) => c.key === initialSort.key && c.sortable !== false);
+    const state = hasInitial
+      ? { key: initialSort.key, dir: initialSort.dir || "desc" }
+      : { key: columns[0].key, dir: "desc" };
 
     const table = el("table");
     const thead = el("thead");
@@ -2690,7 +3174,7 @@
               qid != null &&
               String(qid).trim() !== ""
             ) {
-              appendQueryCellWithAshLinks(td, v, qid);
+              appendQueryCellWithAshLinks(td, v, qid, ashFamilyLinkOptions(row, ashCellOpts));
             } else {
               appendQueryCell(td, v);
             }
@@ -2713,6 +3197,12 @@
           } else if (col.key === "sessions_per_sec") {
             applyMonoTableCellClass(td, col);
             td.textContent = formatAshSessionsPerSec(v);
+          } else if (col.key === "query_members") {
+            appendAshTemplateMembersCell(
+              td,
+              orderTemplateMembers(v, state.key, state.dir),
+              TEMPLATE_MEMBER_RANK_FIELDS[state.key]
+            );
           } else if (col.key === "ash_node_load_distribution") {
             appendAshNodeLoadDistributionCell(td, row.ash_node_load_distribution);
           } else if (col.headerPerCall && col.type === "number") {
@@ -2748,21 +3238,25 @@
           } else if (
             ashCellOpts &&
             ashCellOpts.ashQueryIdLinks &&
-            col.key === "query_id" &&
-            row.query_id != null &&
-            String(row.query_id) !== ""
+            (col.key === "query_id" || col.key === "queryid")
           ) {
-            applyMonoTableCellClass(td, col);
-            const a = el("a", {
-              className: "ash-queryid-deeplink",
-              href: buildAshQueryHref(row.query_id),
-              textContent: v === null || v === undefined ? "" : String(v),
-            });
-            a.addEventListener("click", (e) => {
-              e.preventDefault();
-              navigateToAshForQueryId(row.query_id);
-            });
-            td.appendChild(a);
+            const qid = col.key === "queryid" ? row.queryid : row.query_id;
+            if (qid != null && String(qid).trim() !== "") {
+              applyMonoTableCellClass(td, col);
+              const a = el("a", {
+                className: "ash-queryid-deeplink",
+                href: buildAshQueryHref(qid),
+                textContent: v === null || v === undefined ? "" : String(v),
+              });
+              a.addEventListener("click", (e) => {
+                e.preventDefault();
+                navigateToAshForQueryId(qid);
+              });
+              td.appendChild(a);
+            } else {
+              applyMonoTableCellClass(td, col);
+              td.textContent = v === null || v === undefined ? "" : String(v);
+            }
           } else if (
             ashCellOpts &&
             ashCellOpts.ashNodeLinks &&
@@ -2945,15 +3439,19 @@
           if (col.key === "query") {
             applyMonoTableCellClass(td, col);
             const qid = row.query_id != null && row.query_id !== undefined ? row.query_id : row.queryid;
-            if (pgssAshLinks && row.queryid != null && String(row.queryid) !== "") {
-              appendQueryCellWithAshLinks(td, v, row.queryid);
+            const stmtLink = statementRowAshLink(row);
+            if (pgssAshLinks && stmtLink != null) {
+              appendQueryCellWithAshLinks(td, v, stmtLink.queryId, {
+                canonicalize: stmtLink.canonicalize,
+                dbname: stmtLink.dbname,
+              });
             } else if (
               ashCellOpts &&
               ashCellOpts.ashQueryTextLinks &&
               qid != null &&
               String(qid).trim() !== ""
             ) {
-              appendQueryCellWithAshLinks(td, v, qid);
+              appendQueryCellWithAshLinks(td, v, qid, ashFamilyLinkOptions(row, ashCellOpts));
             } else {
               appendQueryCell(td, v);
             }
@@ -2988,6 +3486,12 @@
           } else if (col.key === "sessions_per_sec") {
             applyMonoTableCellClass(td, col);
             td.textContent = formatAshSessionsPerSec(v);
+          } else if (col.key === "query_members") {
+            appendAshTemplateMembersCell(
+              td,
+              orderTemplateMembers(v, state.key, state.dir),
+              TEMPLATE_MEMBER_RANK_FIELDS[state.key]
+            );
           } else if (col.key === "ash_node_load_distribution") {
             appendAshNodeLoadDistributionCell(td, row.ash_node_load_distribution);
           } else if (col.headerPerCall && col.type === "number") {
@@ -3023,21 +3527,25 @@
           } else if (
             ashCellOpts &&
             ashCellOpts.ashQueryIdLinks &&
-            col.key === "query_id" &&
-            row.query_id != null &&
-            String(row.query_id) !== ""
+            (col.key === "query_id" || col.key === "queryid")
           ) {
-            applyMonoTableCellClass(td, col);
-            const a = el("a", {
-              className: "ash-queryid-deeplink",
-              href: buildAshQueryHref(row.query_id),
-              textContent: v === null || v === undefined ? "" : String(v),
-            });
-            a.addEventListener("click", (e) => {
-              e.preventDefault();
-              navigateToAshForQueryId(row.query_id);
-            });
-            td.appendChild(a);
+            const qid = col.key === "queryid" ? row.queryid : row.query_id;
+            if (qid != null && String(qid).trim() !== "") {
+              applyMonoTableCellClass(td, col);
+              const a = el("a", {
+                className: "ash-queryid-deeplink",
+                href: buildAshQueryHref(qid),
+                textContent: v === null || v === undefined ? "" : String(v),
+              });
+              a.addEventListener("click", (e) => {
+                e.preventDefault();
+                navigateToAshForQueryId(qid);
+              });
+              td.appendChild(a);
+            } else {
+              applyMonoTableCellClass(td, col);
+              td.textContent = v === null || v === undefined ? "" : String(v);
+            }
           } else if (
             ashCellOpts &&
             ashCellOpts.ashNodeLinks &&
@@ -3538,33 +4046,449 @@
     return ordered;
   }
 
-  const HIST_REWRITE_COMMENT_RE = /\/\*[\s\S]*?\*\//g;
-  const HIST_IN_LIST_RE = /\bIN\s*\([^)]*\)/gi;
+  // Strip /* ... */ comments except planner hints (pg_hint_plan / YSQL /*+ ... */), which can
+  // change the chosen plan and must keep templates distinct. Kept identical to Python
+  // _REWRITE_COMMENT_RE.
+  const HIST_REWRITE_COMMENT_RE = /\/\*(?!\+)[\s\S]*?\*\//g;
+  // Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
+  const HIST_IN_LIST_RE = /\bIN\s*\((?!\s*SELECT\b)[^)]*\)/gi;
+  // Bulk VALUES row-list — collapse `VALUES (...),(...),...` (any row count, one level of nested
+  // parens allowed per row) to a canonical `VALUES (...)`. Kept identical to the Python
+  // _VALUES_LIST_RE so grouping matches across the CLI and every panel.
+  const HIST_VALUES_LIST_RE = /\bVALUES\s*\((?:[^()]|\([^()]*\))*\)(?:\s*,\s*\((?:[^()]|\([^()]*\))*\))*/gi;
   const HIST_PLACEHOLDER_RE = /\$\d+/g;
 
   function normalizeQueryTemplate(query) {
     if (!query) return "";
     let q = String(query).replace(HIST_REWRITE_COMMENT_RE, "");
     q = q.replace(HIST_IN_LIST_RE, "IN (...)");
+    q = q.replace(HIST_VALUES_LIST_RE, "VALUES (...)");
     q = q.replace(HIST_PLACEHOLDER_RE, "$N");
     q = q.replace(/\s+/g, " ").trim();
     return q;
   }
 
+  /** Template identity for viewer grouping — full normalize when Merge similar SQL is on. */
+  function queryTemplateKey(query) {
+    if (!mergeSimilarSql) {
+      if (!query) return "";
+      return String(query).replace(/\s+/g, " ").trim();
+    }
+    return normalizeQueryTemplate(query);
+  }
+
+  function canonicalStatementFamilyKey(source, template, dbname) {
+    return `${source}\0${template}\0${source === "ysql" ? String(dbname || "") : ""}`;
+  }
+
+  /**
+   * Snapshot-local query_id ↔ canonical-family index. YSQL families retain dbname because the
+   * statement Top 25 intentionally does not merge the same query shape across databases.
+   */
+  function buildCanonicalStatementFamilyIndex(doc) {
+    const families = new Map();
+    const byQueryId = new Map();
+
+    function addRows(source, rows) {
+      (rows || []).forEach((row) => {
+        const template = normalizeQueryTemplate(row.query);
+        const qid =
+          row.queryid != null && row.queryid !== undefined ? String(row.queryid).trim() : "";
+        if (!template || !qid) return;
+        const dbname =
+          source === "ysql" && row.dbname != null && String(row.dbname).trim() !== ""
+            ? String(row.dbname).trim()
+            : "";
+        const familyKey = canonicalStatementFamilyKey(source, template, dbname);
+        if (!families.has(familyKey)) {
+          families.set(familyKey, {
+            key: familyKey,
+            source,
+            template,
+            dbname: dbname || null,
+            queryIds: new Set(),
+            total_ms: 0,
+          });
+        }
+        const family = families.get(familyKey);
+        family.queryIds.add(qid);
+        family.total_ms += Number(row.total_ms) || 0;
+        if (!byQueryId.has(qid)) byQueryId.set(qid, []);
+        byQueryId.get(qid).push(family);
+      });
+    }
+
+    const pgPer = doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node;
+    const ycqlPer = doc && doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
+    addRows("ysql", pgPer ? mergeStatements(pgPer) : []);
+    addRows("ycql", ycqlPer ? mergeYcqlStatements(ycqlPer) : []);
+    return { families, byQueryId };
+  }
+
+  function resolveCanonicalStatementFamily(index, queryId, dbname) {
+    const qid = queryId != null ? String(queryId).trim() : "";
+    if (!qid || !index || !index.byQueryId) return null;
+    let candidates = (index.byQueryId.get(qid) || []).slice();
+    const wantedDb = dbname != null ? String(dbname).trim() : "";
+    if (wantedDb) {
+      const sameDb = candidates.filter(
+        (family) => family.source === "ysql" && String(family.dbname || "") === wantedDb
+      );
+      if (sameDb.length) candidates = sameDb;
+    }
+    candidates.sort((a, b) => (Number(b.total_ms) || 0) - (Number(a.total_ms) || 0));
+    return candidates[0] || null;
+  }
+
+  function statementRowMatchesCanonicalFamily(row, family) {
+    if (!row || !family) return false;
+    if (normalizeQueryTemplate(row.query) !== family.template) return false;
+    if (family.source !== "ysql") return true;
+    const dbname =
+      row.dbname != null && row.dbname !== undefined ? String(row.dbname).trim() : "";
+    return dbname === String(family.dbname || "");
+  }
+
+  // --- Shared query-template grouping for the statement/ASH panels ------------------------------
+  // These reuse queryTemplateKey (normalizeQueryTemplate when Merge similar SQL is on). The
+  // browser and CLI use the same rules, so a template collapses the same way in every panel.
+
+  /**
+   * Collapse merged statement rows (pg_stat / ycql shape, carrying `_deltaSrc`) into one row per
+   * query template (and dbname, when present). Aggregates the raw totals so the row keeps the exact
+   * same shape as mergeStatements() output (including a fresh `_deltaSrc` and recomputed per-call
+   * fields), which lets it flow through the existing delta / time-% pipeline unchanged. The stable
+   * identity (`queryid` = the template text, `dbname` preserved) makes delta keying line up across
+   * snapshots.
+   */
+  function collapseStatementsByTemplate(mergedRows) {
+    const hasRows = (mergedRows || []).some((r) => Object.prototype.hasOwnProperty.call(r, "rows"));
+    const hasDbname = (mergedRows || []).some((r) =>
+      Object.prototype.hasOwnProperty.call(r, "dbname")
+    );
+    const hasPrepared = (mergedRows || []).some((r) =>
+      Object.prototype.hasOwnProperty.call(r, "is_prepared")
+    );
+    const groups = new Map();
+    (mergedRows || []).forEach((r) => {
+      const key = queryTemplateKey(r.query);
+      if (!key) return;
+      const db =
+        r.dbname != null && String(r.dbname).trim() !== "" ? String(r.dbname).trim() : "";
+      const groupKey = hasDbname ? `${key}\0${db}` : key;
+      if (!groups.has(groupKey)) groups.set(groupKey, { key: key, dbname: db, members: [] });
+      groups.get(groupKey).members.push(r);
+    });
+    const out = [];
+    groups.forEach((g) => {
+      const key = g.key;
+      const members = g.members;
+      if (!key) return;
+      let calls = 0;
+      let exec = 0;
+      let rows = 0;
+      const doc = {};
+      const dbs = new Set();
+      const queryids = [];
+      let anyPrepared = false;
+      // Heaviest member with a real id: the collapsed row's `queryid` is the template text, so ASH
+      // deep links need a statement that actually exists to scope to.
+      let primaryQueryid = null;
+      let primaryMs = -1;
+      members.forEach((m) => {
+        const s = deltaSrcFromRowFallback(m);
+        calls += Number(s.calls) || 0;
+        exec += Number(s.total_exec_time) || 0;
+        const memberMs = Number(s.total_exec_time) || 0;
+        if (memberMs > primaryMs && m.queryid != null && String(m.queryid).trim() !== "") {
+          primaryQueryid = String(m.queryid);
+          primaryMs = memberMs;
+        }
+        if (s.rows != null) rows += Number(s.rows) || 0;
+        if (s.doc) {
+          Object.keys(s.doc).forEach((k) => {
+            doc[k] = (doc[k] || 0) + (Number(s.doc[k]) || 0);
+          });
+        }
+        if (m.dbname != null && String(m.dbname).trim() !== "") dbs.add(String(m.dbname).trim());
+        if (m.queryid != null) queryids.push(String(m.queryid));
+        if (ycqlPreparedTruthy(m.is_prepared)) anyPrepared = true;
+      });
+      const row = {
+        queryid: key,
+        query: key,
+        calls: calls,
+        total_ms: Math.round(exec * 100) / 100,
+        mean_ms: calls ? Math.round((exec / calls) * 100) / 100 : 0,
+        _tmpl_member_count: members.length,
+        _tmpl_queryids: queryids,
+        _tmpl_primary_queryid: primaryQueryid,
+      };
+      if (hasDbname) row.dbname = g.dbname || null;
+      if (hasPrepared) row.is_prepared = anyPrepared;
+      if (hasRows) {
+        row.rows = Math.round(rows * 100) / 100;
+        row.rows_per_call = calls ? Math.round((rows / calls) * 100) / 100 : 0;
+      }
+      Object.keys(doc).forEach((k) => {
+        row[`${k}_per_call`] = calls ? Math.round((doc[k] / calls) * 100) / 100 : 0;
+      });
+      const deltaSrc = { calls: calls, total_exec_time: exec, doc: doc };
+      if (hasRows) deltaSrc.rows = rows;
+      row._deltaSrc = deltaSrc;
+      out.push(row);
+    });
+    out.sort((a, b) => b.total_ms - a.total_ms);
+    return out;
+  }
+
+  /** Summary rows (member_count > 1) for the statement panels' "Recurring query templates" table. */
+  function statementTemplateSummaryRows(rows) {
+    const hasDbname = (rows || []).some((r) => Object.prototype.hasOwnProperty.call(r, "dbname"));
+    const groups = new Map();
+    (rows || []).forEach((r) => {
+      const template = queryTemplateKey(r.query);
+      if (!template) return;
+      const dbname =
+        hasDbname && r.dbname != null && String(r.dbname).trim() !== ""
+          ? String(r.dbname).trim()
+          : "";
+      const key = hasDbname ? `${template}\0${dbname}` : template;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          query_template: template,
+          template: template,
+          dbname: hasDbname ? dbname || null : undefined,
+          calls: 0,
+          calls_per_sec: 0,
+          total_ms: 0,
+          _members: new Map(),
+        });
+      }
+      const g = groups.get(key);
+      g.calls += Number(r.calls) || 0;
+      g.calls_per_sec += Number(r.calls_per_sec) || 0;
+      g.total_ms += Number(r.total_ms) || 0;
+      const qid = r.queryid != null && r.queryid !== undefined ? String(r.queryid).trim() : "";
+      if (!qid) return;
+      if (!g._members.has(qid)) {
+        g._members.set(qid, {
+          query_id: qid,
+          query: r.query != null ? String(r.query) : "",
+          total_ms: 0,
+          calls: 0,
+          calls_per_sec: 0,
+        });
+      }
+      const member = g._members.get(qid);
+      member.total_ms += Number(r.total_ms) || 0;
+      member.calls += Number(r.calls) || 0;
+      member.calls_per_sec += Number(r.calls_per_sec) || 0;
+      if (!member.query && r.query) member.query = String(r.query);
+    });
+    const all = Array.from(groups.values());
+    const totalMs = all.reduce((s, g) => s + g.total_ms, 0);
+    const summary = all
+      .map((g) => {
+        const queryMembers = Array.from(g._members.values())
+          .sort(
+            (a, b) =>
+              b.total_ms - a.total_ms || String(a.query_id).localeCompare(String(b.query_id))
+          )
+          .map((member, i) => ({
+            ...member,
+            total_ms: Math.round(member.total_ms * 100) / 100,
+            calls_per_sec: Math.round(member.calls_per_sec * 100) / 100,
+            rank: i + 1,
+          }));
+        const row = {
+          query_template: g.query_template,
+          template: g.template,
+          query: g.template,
+          queryid: queryMembers.length ? queryMembers[0].query_id : null,
+          members: queryMembers.length,
+          calls: g.calls,
+          calls_per_sec: Math.round(g.calls_per_sec * 100) / 100,
+          total_ms: Math.round(g.total_ms * 100) / 100,
+          time_pct: totalMs > 0 ? Math.round(10000 * (g.total_ms / totalMs)) / 100 : 0,
+          query_members: queryMembers,
+          queryids: queryMembers.map((m) => m.query_id).join(", "),
+        };
+        if (hasDbname) row.dbname = g.dbname != null ? g.dbname : null;
+        return row;
+      })
+      .filter((g) => g.members > 1)
+      .sort((a, b) => b.total_ms - a.total_ms);
+    return summary;
+  }
+
+  // Sort/metric columns stay on the left (matching the panel's original layout); canonical query
+  // and the ranked member list follow.
+  function statementTemplateSummaryColumns(opts) {
+    const options = opts || {};
+    const cols = [];
+    if (options.callsPerSec) {
+      cols.push({ key: "calls_per_sec", label: "calls/s", type: "number", align: "right" });
+    } else {
+      cols.push({ key: "calls", label: "calls", type: "number", align: "right" });
+    }
+    cols.push(
+      { key: "total_ms", label: "total time (ms)", type: "number", align: "right" },
+      { key: "time_pct", label: "time %", type: "number", align: "right" }
+    );
+    if (options.dbname) {
+      cols.push({ key: "dbname", label: "dbname" });
+    }
+    cols.push(
+      { key: "query", label: "canonical query" },
+      { key: "query_members", label: "member queryids (ranked)", sortable: false }
+    );
+    return cols;
+  }
+
+  /** Sort of the "Recurring query templates" tables — mirrors the statement panel (total time desc). */
+  const STATEMENT_TEMPLATE_SUMMARY_SORT = { key: "total_ms", dir: "desc" };
+
+  function relabelQueryColumn(cols, label) {
+    return (cols || []).map((c) => (c.key === "query" ? Object.assign({}, c, { label }) : c));
+  }
+
+  function applyCanonicalizedQueryText(rows) {
+    (rows || []).forEach((r) => {
+      const key = queryTemplateKey(r.query);
+      if (key) r.query = key;
+    });
+    return rows;
+  }
+
+  /** Columns for a template-collapsed statement table: drop per-statement id, keep dbname. */
+  function groupedStatementDisplayColumns(baseCols) {
+    return relabelQueryColumn(
+      (baseCols || []).filter((c) => c.key !== "queryid"),
+      "canonical query"
+    );
+  }
+
+  /** ASH sample grouping by normalized query template; sums samples, counts distinct query_ids. */
+  function groupAshByTemplate(rows) {
+    const m = new Map();
+    (rows || []).forEach((r) => {
+      const q = r.query != null && r.query !== undefined ? String(r.query) : "";
+      const key = queryTemplateKey(q) || "\0__no_query__";
+      if (!m.has(key)) {
+        m.set(key, {
+          query_template: key === "\0__no_query__" ? "" : key,
+          query: key === "\0__no_query__" ? "" : key,
+          query_id: r.query_id != null && r.query_id !== undefined ? r.query_id : null,
+          samples: 0,
+          _members: new Map(),
+        });
+      }
+      const ent = m.get(key);
+      ent.samples += Number(r.samples) || 0;
+      if ((ent.query_id == null || ent.query_id === "") && r.query_id != null) ent.query_id = r.query_id;
+      const qid =
+        r.query_id != null && r.query_id !== undefined ? String(r.query_id).trim() : "";
+      if (qid) {
+        if (!ent._members.has(qid)) {
+          ent._members.set(qid, { query_id: qid, query: q, samples: 0 });
+        }
+        const member = ent._members.get(qid);
+        member.samples += Number(r.samples) || 0;
+        if (!member.query && q) member.query = q;
+      }
+    });
+    return Array.from(m.values())
+      .map((e) => {
+        const queryMembers = Array.from(e._members.values())
+          .sort(
+            (a, b) =>
+              b.samples - a.samples || String(a.query_id).localeCompare(String(b.query_id))
+          )
+          .map((member, i) => ({ ...member, rank: i + 1 }));
+        return {
+          query_template: e.query_template,
+          query: e.query,
+          query_id: queryMembers.length ? queryMembers[0].query_id : e.query_id,
+          samples: e.samples,
+          members: queryMembers.length || 1,
+          query_members: queryMembers,
+        };
+      })
+      .sort((a, b) => b.samples - a.samples);
+  }
+
+  /** Small reusable labeled checkbox (recurring-templates visibility, etc.). */
+  function buildGroupByTemplateControl(checked, onChange, opts) {
+    const options = opts || {};
+    const disabled = !!options.disabled;
+    const wrap = el("label", {
+      className: "tmpl-group-control" + (disabled ? " tmpl-group-control--disabled" : ""),
+    });
+    const chk = el("input", { type: "checkbox" });
+    chk.checked = !!checked && !disabled;
+    chk.disabled = disabled;
+    if (disabled) {
+      wrap.title = options.disabledTitle || "Turn on Merge similar SQL first.";
+    }
+    chk.addEventListener("change", () => onChange(chk.checked));
+    wrap.appendChild(chk);
+    wrap.appendChild(el("span", { textContent: options.label || "Toggle" }));
+    return wrap;
+  }
+
+  function buildShowRecurringTemplatesControl(checked, onChange) {
+    return buildGroupByTemplateControl(checked, onChange, {
+      disabled: !mergeSimilarSql,
+      label: "Show recurring query templates",
+      disabledTitle: "Turn on Merge similar SQL to show recurring query templates.",
+    });
+  }
+
+  /** Viewer-wide Merge similar SQL toggle. */
+  function buildMergeSimilarSqlControl(title) {
+    const wrap = el("label", { className: "tmpl-group-control" });
+    wrap.title =
+      title || "When on, IN-lists, VALUES lists, and bind position variables are collapsed";
+    const chk = el("input", { type: "checkbox" });
+    chk.checked = !!mergeSimilarSql;
+    chk.addEventListener("change", () => {
+      mergeSimilarSql = chk.checked;
+      // Family ASH still needs Merge on; do not record this click as the value to restore.
+      syncMergeSimilarSqlForFamilyScope();
+      if (!mergeSimilarSql) {
+        pgssShowRecurringTemplates = false;
+        ycqlShowRecurringTemplates = false;
+        ashShowRecurringTemplates = false;
+        latencyShowRecurringTemplates = false;
+      }
+      if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+    });
+    wrap.appendChild(chk);
+    wrap.appendChild(el("span", { textContent: "Merge similar SQL" }));
+    return wrap;
+  }
+
   function groupByTemplate(results) {
     const groups = new Map();
     results.forEach((r) => {
-      const key = normalizeQueryTemplate(r.query);
+      const key = queryTemplateKey(r.query);
       r.query_template = key;
+      if (!key) return;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
     });
     const summaries = [];
     groups.forEach((members, key) => {
-      members.sort((a, b) => (a.confidence_rank || 1e9) - (b.confidence_rank || 1e9));
-      members.forEach((r, i) => {
-        r.template_rank = i + 1;
-        r.template_member_count = members.length;
+      // Same ordering as rankByConfidence, computed from the raw signals so member ranks stay
+      // stable no matter which rows the tier / flagged-only filters are currently showing.
+      members.sort((a, b) => {
+        const da = a.dip_p == null ? 1 : a.dip_p;
+        const db = b.dip_p == null ? 1 : b.dip_p;
+        if (da !== db) return da - db;
+        const bcDiff = (b.bc || 0) - (a.bc || 0);
+        if (bcDiff) return bcDiff;
+        return String(a.queryid).localeCompare(String(b.queryid));
       });
       const best = members[0];
       const peakSet = new Set();
@@ -3580,12 +4504,27 @@
           if (pp.gap_ratio != null) gapRatio.push(pp.gap_ratio);
         });
       });
+      const queryMembers = members.map((r, i) => ({
+        query_id: r.queryid != null && r.queryid !== undefined ? String(r.queryid) : "",
+        query: r.query != null ? String(r.query) : "",
+        dbname: r.dbname != null && String(r.dbname).trim() !== "" ? String(r.dbname).trim() : null,
+        calls: r.calls,
+        tier: r.confidence_tier || "not_flagged",
+        rank: i + 1,
+      })).filter((m) => m.query_id);
+      // best_confidence_rank comes from rankByConfidence over the full analyzed set (caller
+      // stamps it before grouping); do not fall back to 0 — that sorted as missing (1e9).
+      const bestRank = best.confidence_rank;
       summaries.push({
+        query_template: key,
         template: key,
         member_count: members.length,
-        best_confidence_rank: best.confidence_rank || 0,
+        members: queryMembers.length || members.length,
+        best_confidence_rank: bestRank != null && bestRank !== "" ? Number(bestRank) : 1e9,
         best_confidence_tier: best.confidence_tier || "not_flagged",
-        queryids: members.map((r) => r.queryid),
+        queryids: queryMembers.map((m) => m.query_id),
+        query_members: queryMembers,
+        dbname: best.dbname != null && String(best.dbname).trim() !== "" ? String(best.dbname).trim() : null,
         peak_counts: Array.from(peakSet).sort((a, b) => a - b),
         // Best member's full adjacent-pair list (display); ranges span every pair.
         peak_pairs: (best.peak_pairs || []).slice(),
@@ -3593,9 +4532,7 @@
         gap_ratio_range: gapRatio.length ? [Math.min(...gapRatio), Math.max(...gapRatio)] : null,
       });
     });
-    summaries.sort(
-      (a, b) => (a.best_confidence_rank || 1e9) - (b.best_confidence_rank || 1e9)
-    );
+    summaries.sort((a, b) => a.best_confidence_rank - b.best_confidence_rank);
     return summaries;
   }
 
@@ -3633,8 +4570,9 @@
       if (!res.calls) res.calls = r.calls;
       return res;
     });
-    // Ranking and template grouping are deferred to the panel so they run over the
-    // currently-displayed (filtered) rows, matching the Python report ordering.
+    // Ranking and template grouping happen in the panel: groups use the full analyzed
+    // set so "best" ranks stay stable under min-tier / flagged-only; the table is then
+    // re-ranked among the visible rows (that visible re-rank matches the Python report).
     return { mode, results, source: "browser" };
   }
 
@@ -3666,7 +4604,7 @@
 
   function renderLatencyPanel(panel, doc, prevDoc) {
     const analysis = analyzeLatencyDoc(doc, prevDoc);
-    const state = { minTier: "high", flaggedOnly: false };
+    const state = { minTier: latencyMinTier, flaggedOnly: latencyFlaggedOnly };
 
     const offline = analysis.source === "offline";
     const banner = el("div", { className: "pgss-activity-banner latency-banner" });
@@ -3727,6 +4665,7 @@
 
     const flagWrap = el("label", { className: "latency-control" });
     const flagChk = el("input", { type: "checkbox" });
+    flagChk.checked = !!state.flaggedOnly;
     flagWrap.appendChild(flagChk);
     flagWrap.appendChild(el("span", { textContent: "flagged only" }));
     controls.appendChild(flagWrap);
@@ -3738,6 +4677,13 @@
     dipWrap.appendChild(el("span", { textContent: "show dip_p" }));
     controls.appendChild(dipWrap);
     panel.appendChild(controls);
+    panel.appendChild(buildMergeSimilarSqlControl());
+    panel.appendChild(
+      buildShowRecurringTemplatesControl(mergeSimilarSql && latencyShowRecurringTemplates, (v) => {
+        latencyShowRecurringTemplates = v;
+        rerender();
+      })
+    );
 
     const legend = el("div", { className: "latency-legend" });
     legend.appendChild(
@@ -3746,7 +4692,7 @@
         textContent: "Reading the columns",
       })
     );
-    [
+    const legendRows = [
       [
         "bc",
         "Bimodality coefficient (Sarle): (skew\u00b2 + 1) / kurtosis over log\u2082 latency midpoints. " +
@@ -3781,7 +4727,8 @@
           "10\u2013100\u00d7 gap looks more like retries, leader/follower reads, or cross-AZ hops). " +
           "This is distinct from spread (overall min\u2013max range).",
       ],
-    ].forEach(([k, v]) => {
+    ];
+    legendRows.forEach(([k, v]) => {
       const row = el("div", { className: "latency-legend-row" });
       row.appendChild(el("code", { className: "latency-legend-key", textContent: k }));
       row.appendChild(el("span", { className: "latency-legend-val", textContent: v }));
@@ -3795,16 +4742,32 @@
     panel.appendChild(tableHolder);
 
     function rerender() {
+      // Stamp confidence_rank on every analyzed statement first so template "best" ranks stay
+      // stable when tier / flagged-only filters hide some members. The filtered table below is
+      // re-ranked among the visible rows only.
+      rankByConfidence(analysis.results);
+      const groups = groupByTemplate(analysis.results);
+
       let rows = analysis.results.slice();
       if (state.flaggedOnly) rows = rows.filter((r) => r.flag);
       if (state.minTier !== "all") {
         const th = HIST_TIER_RANK[state.minTier] || 0;
         rows = rows.filter((r) => (HIST_TIER_RANK[r.confidence_tier] || 0) >= th);
       }
-      // Rank + group over the filtered rows so ranks and template rollups describe
-      // exactly what's shown (matches the Python report ordering).
       rows = rankByConfidence(rows);
-      const groups = groupByTemplate(rows);
+      const shownTemplates = new Set(
+        rows.map((r) => r.query_template || queryTemplateKey(r.query)).filter(Boolean)
+      );
+      // Without Merge similar SQL a "template" is just the exact SQL text, so the recurring
+      // rollup is suppressed rather than shown as singletons.
+      const recurring = mergeSimilarSql
+        ? groups.filter(
+            (g) =>
+              (g.member_count || g.members || 0) > 1 &&
+              g.query_template &&
+              shownTemplates.has(g.query_template)
+          )
+        : [];
 
       const displayRows = rows.map((r) => ({
         tier: r.confidence_tier,
@@ -3815,9 +4778,9 @@
         peaks: r.n_raw_peaks,
         spread: histSpreadStr(r),
         gap: histGapStr(r),
-        tmpl: r.template_member_count > 1 ? `${r.template_rank}/${r.template_member_count}` : "",
+        query: mergeSimilarSql ? queryTemplateKey(r.query) || r.query : r.query,
         queryid: r.queryid,
-        query: r.query,
+        dbname: r.dbname,
       }));
       const cols = [
         { key: "tier", label: "tier", type: "number", sortValue: (r) => HIST_TIER_RANK[r.tier] || 0 },
@@ -3832,9 +4795,8 @@
         { key: "peaks", label: "peaks", type: "number", align: "right" },
         { key: "spread", label: "spread" },
         { key: "gap", label: "gap" },
-        { key: "tmpl", label: "tmpl" },
-        { key: "queryid", label: "queryid" },
-        { key: "query", label: "query" }
+        { key: "query", label: mergeSimilarSql ? "canonical query" : "query" },
+        { key: "queryid", label: "queryid" }
       );
       tableHolder.textContent = "";
       const total = analysis.results.length;
@@ -3844,20 +4806,25 @@
           `Latency modes — ${displayRows.length} shown (${flaggedN} flagged / ${total} analyzed)`,
           displayRows,
           cols,
-          "sec-latency-main"
+          "sec-latency-main",
+          {
+            ashQueryTextLinks: true,
+            ashQueryIdLinks: true,
+            canonicalizeFamily: !!mergeSimilarSql,
+          }
         )
       );
 
-      const recurring = groups.filter((g) => g.member_count > 1);
       groupHolder.textContent = "";
-      if (recurring.length) {
+      if (latencyShowRecurringTemplates && recurring.length) {
         const grpRows = recurring.map((g) => ({
           best_tier: g.best_confidence_tier,
-          members: g.member_count,
           peaks: (g.peak_counts || []).join(",") || "",
           gap: histGapStr(g),
-          queryids: (g.queryids || []).join(", "),
-          template: g.template,
+          query: g.template,
+          queryid: (g.queryids && g.queryids[0]) || null,
+          dbname: g.dbname || (g.query_members && g.query_members[0] && g.query_members[0].dbname) || null,
+          query_members: g.query_members,
         }));
         const grpCols = [
           {
@@ -3866,29 +4833,31 @@
             type: "number",
             sortValue: (r) => HIST_TIER_RANK[r.best_tier] || 0,
           },
-          { key: "members", label: "members", type: "number", align: "right" },
           { key: "peaks", label: "peaks" },
           { key: "gap", label: "gap" },
-          { key: "queryids", label: "queryids" },
-          { key: "template", label: "template" },
+          { key: "query", label: "canonical query" },
+          { key: "query_members", label: "member queryids (ranked)", sortable: false },
         ];
         groupHolder.appendChild(
           buildSortableTable(
             `Recurring query templates (${recurring.length})`,
             grpRows,
             grpCols,
-            "sec-latency-groups"
+            "sec-latency-groups",
+            { ashQueryTextLinks: true, canonicalizeFamily: true }
           )
         );
       }
     }
 
     tierSel.addEventListener("change", () => {
-      state.minTier = tierSel.value;
+      latencyMinTier = tierSel.value;
+      state.minTier = latencyMinTier;
       rerender();
     });
     flagChk.addEventListener("change", () => {
-      state.flaggedOnly = flagChk.checked;
+      latencyFlaggedOnly = flagChk.checked;
+      state.flaggedOnly = latencyFlaggedOnly;
       rerender();
     });
     dipChk.addEventListener("change", () => {
@@ -3915,6 +4884,17 @@
     const ycqlSt = doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
     const ash = doc.yb_active_session_history && doc.yb_active_session_history.per_node;
     const topo = doc.node_topology || {};
+    const canonicalFamilyIndex = buildCanonicalStatementFamilyIndex(doc);
+    const canonicalFamily =
+      ashQueryIdFilter && ashCanonicalizeFilter
+        ? resolveCanonicalStatementFamily(
+            canonicalFamilyIndex,
+            ashQueryIdFilter,
+            ashCanonicalDbnameFilter
+          )
+        : null;
+    canonicalFamilyResolved = !!canonicalFamily;
+    syncMergeSimilarSqlForFamilyScope();
 
     const panelPgss = el("div", {
       className: "app-panel",
@@ -3955,23 +4935,14 @@
     if (st) {
       const merged = mergeStatements(st);
       const prevSt = prevDoc && prevDoc.pg_stat_statements && prevDoc.pg_stat_statements.per_node;
-      let pgTitle = "Top 25 — pg_stat_statements";
-      let pgRows = withPgStatTimePercent(merged);
-      let pgCols = pgStatStatementColumns(pgRows, st);
+      const isDelta = !!(prevDoc && prevSt);
+      const grouped = mergeSimilarSql;
       const pgSort = { key: "total_ms", dir: "desc" };
-      if (prevDoc && prevSt) {
-        const mergedPrev = mergeStatements(prevSt);
-        const deltaRows = deltaPgStatMergedRows(merged, mergedPrev);
+
+      if (isDelta) {
         panelPgss.appendChild(
           pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc, curFile)
         );
-        pgTitle = "Top 25 — pg_stat_statements (Δ vs prior snapshot)";
-        pgRows = withPgStatDeltaDerivedRows(
-          deltaRows,
-          prevDoc.generated_at_utc,
-          doc.generated_at_utc
-        );
-        pgCols = pgStatStatementColumnsDelta(pgRows, st);
       } else {
         panelPgss.appendChild(pgStatActivityBannerAt(doc.generated_at_utc, curFile));
         if (prevDoc && !prevSt) {
@@ -3984,6 +4955,91 @@
           );
         }
       }
+
+      // Ungrouped display rows (used for the recurring-templates summary and the ungrouped table).
+      let baseRows;
+      if (isDelta) {
+        baseRows = withPgStatDeltaDerivedRows(
+          deltaPgStatMergedRows(merged, mergeStatements(prevSt)),
+          prevDoc.generated_at_utc,
+          doc.generated_at_utc
+        );
+      } else {
+        baseRows = withPgStatTimePercent(merged);
+      }
+
+      panelPgss.appendChild(buildMergeSimilarSqlControl());
+      panelPgss.appendChild(
+        buildShowRecurringTemplatesControl(mergeSimilarSql && pgssShowRecurringTemplates, (v) => {
+          pgssShowRecurringTemplates = v;
+          if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+        })
+      );
+
+      const pgSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
+      if (pgssShowRecurringTemplates && pgSummary.length) {
+        panelPgss.appendChild(
+          buildSortableTable(
+            `Recurring query templates (${pgSummary.length})`,
+            pgSummary,
+            statementTemplateSummaryColumns({
+              callsPerSec: isDelta,
+              dbname: pgSummary.some((r) => Object.prototype.hasOwnProperty.call(r, "dbname")),
+            }),
+            "sec-pgss-templates",
+            { ashQueryTextLinks: true, canonicalizeFamily: true },
+            STATEMENT_TEMPLATE_SUMMARY_SORT
+          )
+        );
+      }
+
+      let pgTitle;
+      let pgRows;
+      let pgCols;
+      if (grouped) {
+        if (isDelta) {
+          const collapsedCur = collapseStatementsByTemplate(merged);
+          const collapsedPrev = collapseStatementsByTemplate(mergeStatements(prevSt));
+          const memberByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
+          );
+          const primaryByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
+          );
+          pgRows = withPgStatDeltaDerivedRows(
+            deltaPgStatMergedRows(collapsedCur, collapsedPrev),
+            prevDoc.generated_at_utc,
+            doc.generated_at_utc
+          );
+          pgRows.forEach((r) => {
+            r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
+            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
+          });
+          applyCanonicalizedQueryText(pgRows);
+          pgCols = groupedStatementDisplayColumns(pgStatStatementColumnsDelta(pgRows, st));
+          pgTitle = "Top 25 — pg_stat_statements (Δ vs prior snapshot)";
+        } else {
+          pgRows = withPgStatTimePercent(collapseStatementsByTemplate(merged));
+          applyCanonicalizedQueryText(pgRows);
+          pgCols = groupedStatementDisplayColumns(pgStatStatementColumns(pgRows, st));
+          pgTitle = "Top 25 — pg_stat_statements";
+        }
+      } else {
+        pgRows = baseRows;
+        const pgBaseCols = isDelta
+          ? pgStatStatementColumnsDelta(pgRows, st)
+          : pgStatStatementColumns(pgRows, st);
+        if (mergeSimilarSql) {
+          applyCanonicalizedQueryText(pgRows);
+          pgCols = relabelQueryColumn(pgBaseCols, "canonical query");
+        } else {
+          pgCols = pgBaseCols;
+        }
+        pgTitle = isDelta
+          ? "Top 25 — pg_stat_statements (Δ vs prior snapshot)"
+          : "Top 25 — pg_stat_statements";
+      }
+
       panelPgss.appendChild(
         buildSortablePaginatedTable(pgTitle, pgRows, pgCols, 25, "sec-pgss-main", pgSort, {
           unifyStatementHeaders: true,
@@ -4003,29 +5059,14 @@
       const mergedYcql = mergeYcqlStatements(ycqlSt);
       const prevYcqlSt =
         prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
-      let ycqlTitle = "Top 25 — ycql_stat_statements";
-      let ycqlRows = withPgStatTimePercent(mergedYcql);
-      let ycqlCols = ycqlStatStatementColumns();
+      const isDelta = !!(prevDoc && prevYcqlSt);
+      const grouped = mergeSimilarSql;
       const ycqlSort = { key: "total_ms", dir: "desc" };
-      if (prevDoc && prevYcqlSt) {
-        const mergedYcqlPrev = mergeYcqlStatements(prevYcqlSt);
-        const prepByKey = new Map(
-          mergedYcql.map((r) => [statementMergeKey(r), !!r.is_prepared])
-        );
-        const deltaYcqlRows = deltaPgStatMergedRows(mergedYcql, mergedYcqlPrev).map((r) => ({
-          ...r,
-          is_prepared: prepByKey.get(statementMergeKey(r)) || false,
-        }));
+
+      if (isDelta) {
         panelYcql.appendChild(
           pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc, curFile)
         );
-        ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
-        ycqlRows = withPgStatDeltaDerivedRows(
-          deltaYcqlRows,
-          prevDoc.generated_at_utc,
-          doc.generated_at_utc
-        );
-        ycqlCols = ycqlStatStatementColumnsDelta();
       } else {
         panelYcql.appendChild(pgStatActivityBannerAt(doc.generated_at_utc, curFile));
         if (prevDoc && !prevYcqlSt) {
@@ -4038,6 +5079,103 @@
           );
         }
       }
+
+      let baseRows;
+      if (isDelta) {
+        const mergedYcqlPrev = mergeYcqlStatements(prevYcqlSt);
+        const prepByKey = new Map(mergedYcql.map((r) => [statementMergeKey(r), !!r.is_prepared]));
+        const deltaYcqlRows = deltaPgStatMergedRows(mergedYcql, mergedYcqlPrev).map((r) => ({
+          ...r,
+          is_prepared: prepByKey.get(statementMergeKey(r)) || false,
+        }));
+        baseRows = withPgStatDeltaDerivedRows(
+          deltaYcqlRows,
+          prevDoc.generated_at_utc,
+          doc.generated_at_utc
+        );
+      } else {
+        baseRows = withPgStatTimePercent(mergedYcql);
+      }
+
+      panelYcql.appendChild(
+        buildMergeSimilarSqlControl(
+          "YCQL uses ? bind markers, so $N collapsing does not apply, and CQL has no multi-row VALUES lists; IN (...) lists, single-row VALUES, and comments still collapse"
+        )
+      );
+      panelYcql.appendChild(
+        buildShowRecurringTemplatesControl(mergeSimilarSql && ycqlShowRecurringTemplates, (v) => {
+          ycqlShowRecurringTemplates = v;
+          if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+        })
+      );
+
+      const ycqlSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
+      if (ycqlShowRecurringTemplates && ycqlSummary.length) {
+        panelYcql.appendChild(
+          buildSortableTable(
+            `Recurring query templates (${ycqlSummary.length})`,
+            ycqlSummary,
+            statementTemplateSummaryColumns({ callsPerSec: isDelta }),
+            "sec-ycql-templates",
+            { ashQueryTextLinks: true, canonicalizeFamily: true },
+            STATEMENT_TEMPLATE_SUMMARY_SORT
+          )
+        );
+      }
+
+      let ycqlTitle;
+      let ycqlRows;
+      let ycqlCols;
+      if (grouped) {
+        if (isDelta) {
+          const collapsedCur = collapseStatementsByTemplate(mergedYcql);
+          const collapsedPrev = collapseStatementsByTemplate(mergeYcqlStatements(prevYcqlSt));
+          const prepByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), !!r.is_prepared])
+          );
+          const memberByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
+          );
+          const primaryByKey = new Map(
+            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
+          );
+          ycqlRows = withPgStatDeltaDerivedRows(
+            deltaPgStatMergedRows(collapsedCur, collapsedPrev).map((r) => ({
+              ...r,
+              is_prepared: prepByKey.get(statementMergeKey(r)) || false,
+            })),
+            prevDoc.generated_at_utc,
+            doc.generated_at_utc
+          );
+          ycqlRows.forEach((r) => {
+            r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
+            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
+          });
+          applyCanonicalizedQueryText(ycqlRows);
+          ycqlCols = groupedStatementDisplayColumns(ycqlStatStatementColumnsDelta());
+          ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
+        } else {
+          ycqlRows = withPgStatTimePercent(collapseStatementsByTemplate(mergedYcql));
+          applyCanonicalizedQueryText(ycqlRows);
+          ycqlCols = groupedStatementDisplayColumns(ycqlStatStatementColumns());
+          ycqlTitle = "Top 25 — ycql_stat_statements";
+        }
+      } else {
+        ycqlRows = baseRows;
+        const ycqlBaseCols = isDelta
+          ? ycqlStatStatementColumnsDelta()
+          : ycqlStatStatementColumns();
+        if (mergeSimilarSql) {
+          applyCanonicalizedQueryText(ycqlRows);
+          ycqlCols = relabelQueryColumn(ycqlBaseCols, "canonical query");
+        } else {
+          ycqlCols = ycqlBaseCols;
+        }
+        ycqlTitle = isDelta
+          ? "Top 25 — ycql_stat_statements (Δ vs prior snapshot)"
+          : "Top 25 — ycql_stat_statements";
+      }
+
       panelYcql.appendChild(
         buildSortablePaginatedTable(
           ycqlTitle,
@@ -4046,7 +5184,10 @@
           25,
           "sec-ycql-main",
           ycqlSort,
-          { unifyStatementHeaders: true, pgssAshLinks: true }
+          {
+            unifyStatementHeaders: true,
+            pgssAshLinks: true,
+          }
         )
       );
     } else {
@@ -4065,7 +5206,11 @@
       const tableF = ashTableIdFilter;
       let ashData = ash;
       if (nodeF) ashData = filterAshPerNodeByNodeId(ashData, nodeF);
-      if (qF) ashData = filterAshPerNodeByQueryId(ashData, qF);
+      if (qF) {
+        ashData = canonicalFamily
+          ? filterAshPerNodeByCanonicalFamily(ashData, canonicalFamily)
+          : filterAshPerNodeByQueryId(ashData, qF);
+      }
       if (tableF) ashData = filterAshPerNodeByTableId(ashData, tableF);
 
       if (nodeF) {
@@ -4141,12 +5286,16 @@
         panelAsh.appendChild(bn);
       }
       if (qF) {
-        const qRaw = getQueryTextForToolbar(doc, qF);
+        const qRaw = canonicalFamily ? canonicalFamily.template : getQueryTextForToolbar(doc, qF);
         const qText =
           qRaw != null && String(qRaw).trim() !== "" ? String(qRaw).trim() : "";
         const note = el("div", { className: "ash-mode-banner ash-mode-banner--scoped" });
-        let ashQueryTitle = `query_id=${qF}`;
-        if (st) {
+        let ashQueryTitle = canonicalFamily
+          ? `canonical family (${canonicalFamily.queryIds.size} query_ids); representative query_id=${qF}`
+          : `query_id=${qF}`;
+        if (canonicalFamily && canonicalFamily.dbname) {
+          ashQueryTitle += `; dbname=${canonicalFamily.dbname}`;
+        } else if (st) {
           const rowDb = mergedStatementRowForQuery(st, mergeStatements, qF);
           if (rowDb && rowDb.dbname) ashQueryTitle += `; dbname=${rowDb.dbname}`;
         }
@@ -4157,7 +5306,12 @@
           })
         );
         const row = el("div", { className: "ash-mode-banner-query-row" });
-        row.appendChild(el("span", { className: "ash-mode-banner-query-k", textContent: "query" }));
+        row.appendChild(
+          el("span", {
+            className: "ash-mode-banner-query-k",
+            textContent: canonicalFamily ? "canonical query" : "query",
+          })
+        );
         row.appendChild(
           el("span", {
             className: qText
@@ -4167,7 +5321,7 @@
           })
         );
         note.appendChild(row);
-        appendAshScopedQueryStatementLines(note, doc, prevDoc, qF, ash);
+        appendAshScopedQueryStatementLines(note, doc, prevDoc, qF, ash, canonicalFamily);
         panelAsh.appendChild(note);
       }
       const ashClusterNodes = ashSnapshotClusterNodeCount(doc, ash);
@@ -4175,13 +5329,16 @@
       /* Same pg_stat query text as merged rows so namespace+query / ns+object+query load-dist keys match. */
       const flatAsh = enrichAshRowsQueryFromPgStat(doc, flattenAsh(ashData, topo));
 
-      let mergedAsh = enrichAshRowsQueryFromPgStat(doc, mergeAsh(ashData));
+      let mergedAshByQueryId = enrichAshRowsQueryFromPgStat(doc, mergeAsh(ashData));
+      let mergedAsh = mergeSimilarSql
+        ? collapseAshMergedByCanonicalQuery(mergedAshByQueryId)
+        : mergedAshByQueryId;
       mergedAsh = attachAshNodeLoadDistribution(
         mergedAsh,
         flatAsh,
-        ashMergeKey,
+        mergeSimilarSql ? ashMergeKeyCanonical : ashMergeKey,
         ashShowNodeLoadDist,
-        true
+        !mergeSimilarSql
       );
 
       const ashIntervalSec = ashWindowIntervalSeconds(doc);
@@ -4207,13 +5364,17 @@
         { key: "wait_event_component", label: "component" },
         { key: "wait_event_type", label: "wait_event_type" },
         { key: "wait_event", label: "wait_event" },
-        { key: "query", label: "query" },
+        { key: "query", label: ashQueryColumnLabel() },
         { key: "query_id", label: "query_id" },
       ];
       const ashMainColsAll = tableF
         ? ashMainColsBase.filter((c) => c.key !== "namespace_name" && c.key !== "object_name")
         : ashMainColsBase;
-      const ashMainColsStripped = qF ? ashColumnsWithoutQueryIdAndQuery(ashMainColsAll) : ashMainColsAll;
+      const ashMainColsStripped = qF
+        ? canonicalFamily
+          ? ashColumnsWithoutQuery(ashMainColsAll)
+          : ashColumnsWithoutQueryIdAndQuery(ashMainColsAll)
+        : ashMainColsAll;
       const ashMainCols = spliceAshNodeLoadDistributionColumn(
         ashMainColsStripped,
         ashClusterNodes,
@@ -4223,27 +5384,78 @@
         ashObjectLinks: true,
         ashQueryIdLinks: true,
         ashQueryTextLinks: true,
+        canonicalizeFamily: !!mergeSimilarSql,
       };
       const ashPaginatedOpts = { ashCellOpts: ashReportCellOpts };
-      const ashMainTop50GroupLabel = qF
-        ? "Table/Index + Wait_Event"
-        : tableF
-        ? "Query + Wait_Event"
-        : "Table/Index + Query + Wait_Event";
-      panelAsh.appendChild(
-        buildSortablePaginatedTable(
-          `Top 50 Active Sessions/sec Grouped By: ${ashMainTop50GroupLabel}`,
-          mergedAshL,
-          ashMainCols,
-          50,
-          "sec-ash-main",
-          undefined,
-          ashPaginatedOpts
-        )
-      );
+      // Sort columns (Active Sessions/sec, Load %) stay on the left; canonical query and ranked
+      // member query_ids follow.
+      const ashTemplateSummaryCols = [
+        ASH_SPS_COL,
+        ASH_LOAD_COL,
+        { key: "query", label: "canonical query" },
+        { key: "query_members", label: "member query_ids (ranked)", sortable: false },
+      ];
+
+      // Recurring query templates for ASH. The wait-event Top 50 stays the main table; Merge similar SQL
+      // only changes how that table groups query text.
+      const byTemplateL = !qF
+        ? withAshTemplateMemberRates(ashEnriched(groupAshByTemplate(mergedAshByQueryId)))
+        : [];
+      if (!qF) {
+        panelAsh.appendChild(buildMergeSimilarSqlControl());
+        panelAsh.appendChild(
+          buildShowRecurringTemplatesControl(mergeSimilarSql && ashShowRecurringTemplates, (v) => {
+            ashShowRecurringTemplates = v;
+            if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
+          })
+        );
+        const ashTemplateSummary = mergeSimilarSql
+          ? byTemplateL.filter(
+              (r) => String(r.query_template || "").trim() !== "" && (Number(r.members) || 1) > 1
+            )
+          : [];
+        if (ashShowRecurringTemplates && ashTemplateSummary.length) {
+          panelAsh.appendChild(
+            buildSortableTable(
+              `Recurring query templates (${ashTemplateSummary.length})`,
+              ashTemplateSummary,
+              ashTemplateSummaryCols,
+              "sec-ash-templates",
+              Object.assign({}, ashReportCellOpts, { canonicalizeFamily: true })
+            )
+          );
+        }
+      }
+
+      {
+        const ashMainTop50GroupLabel = qF
+          ? canonicalFamily
+            ? "Table/Index + Canonical Query + Wait_Event"
+            : "Table/Index + Wait_Event"
+          : tableF
+          ? mergeSimilarSql
+            ? "Canonical Query + Wait_Event"
+            : "Query + Wait_Event"
+          : mergeSimilarSql
+          ? "Table/Index + Canonical Query + Wait_Event"
+          : "Table/Index + Query + Wait_Event";
+        let ashMainRows = mergedAshL;
+        let ashMainDisplayCols = ashMainCols;
+        panelAsh.appendChild(
+          buildSortablePaginatedTable(
+            `Top 50 Active Sessions/sec Grouped By: ${ashMainTop50GroupLabel}`,
+            ashMainRows,
+            ashMainDisplayCols,
+            50,
+            "sec-ash-main",
+            undefined,
+            ashPaginatedOpts
+          )
+        );
+      }
 
       if (tableF) {
-        let byQueryId = groupAshByQueryId(mergedAsh);
+        let byQueryId = groupAshByQueryId(mergedAshByQueryId);
         byQueryId = attachAshNodeLoadDistribution(
           byQueryId,
           flatAsh,
@@ -4253,13 +5465,13 @@
         const byQueryIdL = ashEnriched(byQueryId);
         panelAsh.appendChild(
           buildSortableTable(
-            `Active Sessions/Sec Grouped By: Query (${byQueryIdL.length} groups)`,
+            `Active Sessions/Sec Grouped By: ${mergeSimilarSql ? "Canonical Query" : "Query"} (${byQueryIdL.length} groups)`,
             byQueryIdL,
             spliceAshNodeLoadDistributionColumn(
               [
                 ASH_SPS_COL,
                 ASH_LOAD_COL,
-                { key: "query", label: "query" },
+                { key: "query", label: ashQueryColumnLabel() },
                 { key: "query_id", label: "query_id" },
               ],
               ashClusterNodes,
@@ -4272,7 +5484,7 @@
       }
 
       if (!qF && !tableF) {
-        let byNsQuery = groupAshByNamespaceQuery(mergedAsh);
+        let byNsQuery = groupAshByNamespaceQuery(mergedAshByQueryId);
         byNsQuery = attachAshNodeLoadDistribution(
           byNsQuery,
           flatAsh,
@@ -4280,23 +5492,25 @@
           ashShowNodeLoadDist
         );
         const byNsQueryL = ashEnriched(byNsQuery);
-        const byNsQueryColsAll = spliceAshNodeLoadDistributionColumn(
+        const byNsQueryCols = spliceAshNodeLoadDistributionColumn(
           [
             ASH_SPS_COL,
             ASH_LOAD_COL,
             { key: "namespace_name", label: "namespace" },
-            { key: "query", label: "query" },
-            { key: "query_id", label: "query_id" },
-          ],
+            {
+              key: "query",
+              label: mergeSimilarSql ? "canonical query" : "query",
+            },
+          ].concat(mergeSimilarSql ? [] : [{ key: "query_id", label: "query_id" }]),
           ashClusterNodes,
           ashShowNodeLoadDist
         );
-        const byNsQueryTitle = `Active Sessions/Sec Grouped By: Database & Query (${byNsQueryL.length} groups)`;
+        const byNsQueryTitle = `Active Sessions/Sec Grouped By: Database & ${mergeSimilarSql ? "Canonical Query" : "Query"} (${byNsQueryL.length} groups)`;
         panelAsh.appendChild(
-          buildSortableTable(byNsQueryTitle, byNsQueryL, byNsQueryColsAll, "sec-ash-ns-q", ashReportCellOpts)
+          buildSortableTable(byNsQueryTitle, byNsQueryL, byNsQueryCols, "sec-ash-ns-q", ashReportCellOpts)
         );
 
-        let byNsObjBuckets = ashAggregateNsObjectBuckets(mergedAsh);
+        let byNsObjBuckets = ashAggregateNsObjectBuckets(mergedAshByQueryId);
         byNsObjBuckets = attachAshNodeLoadDistribution(
           byNsObjBuckets,
           flatAsh,
@@ -4328,7 +5542,7 @@
       }
 
       if (!tableF) {
-        let byNsObjQuery = groupAshByNamespaceObjectQuery(mergedAsh, { ignoreQueryInKey: !!qF });
+        let byNsObjQuery = groupAshByNamespaceObjectQuery(mergedAshByQueryId, { ignoreQueryInKey: !!qF });
         byNsObjQuery = attachAshNodeLoadDistribution(
           byNsObjQuery,
           flatAsh,
@@ -4338,21 +5552,23 @@
         const byNsObjQueryL = ashEnriched(byNsObjQuery);
         const byNsObjQueryTitle = qF
           ? `Active Sessions/sec Grouped By: Database + Table/Index (${byNsObjQueryL.length} groups)`
-          : `Active Sessions/Sec Grouped By: Table/Index & Query (${byNsObjQueryL.length} groups)`;
+          : `Active Sessions/Sec Grouped By: Table/Index & ${mergeSimilarSql ? "Canonical Query" : "Query"} (${byNsObjQueryL.length} groups)`;
         const byNsObjQueryColsAll = spliceAshNodeLoadDistributionColumn(
           [
             ASH_SPS_COL,
             ASH_LOAD_COL,
             { key: "namespace_name", label: "namespace" },
             { key: "object_name", label: "object_name" },
-            { key: "query", label: "query" },
+            { key: "query", label: ashQueryColumnLabel() },
             { key: "query_id", label: "query_id" },
           ],
           ashClusterNodes,
           ashShowNodeLoadDist
         );
-        const byNsObjQueryCols = qF
-          ? ashColumnsWithoutQueryIdAndQuery(byNsObjQueryColsAll)
+        let byNsObjQueryCols = qF
+          ? canonicalFamily
+            ? ashColumnsWithoutQuery(byNsObjQueryColsAll)
+            : ashColumnsWithoutQueryIdAndQuery(byNsObjQueryColsAll)
           : byNsObjQueryColsAll;
         panelAsh.appendChild(
           buildSortableTable(

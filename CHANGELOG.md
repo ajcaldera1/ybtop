@@ -2,6 +2,17 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [0.1.13] — 2026-08-12
+
+### Added
+
+- **Browser (query-template grouping):** The statement, ASH, and Latency-modes tabs can treat bind-count / IN-list / VALUES-list variants as one shape. **Merge similar SQL** (off by default) is the viewer-wide switch — there is no separate group-by control. With it on, query columns become **canonical query**, YSQL/YCQL Top 25s fold to one row per canonical query (YSQL still split by **dbname**), and ASH groups the Top 50 by **Table/Index + Canonical Query + Wait_Event** (unresolved SQL stays split by `query_id` so distinct sessions do not collapse). Clicking canonical-query text in any table opens `?view=ash&query=…&canonicalize=t` for the whole snapshot-local family; clicking a concrete `queryid` or member id always opens the ordinary one-id report. Family reports aggregate statement metrics plus ASH breakdowns across every matching `query_id`; YSQL links also carry **dbname**, while unresolved ids fall back to the one-id report. Family rows label their heaviest member as **representative query_id**. With Merge off, blank-query ASH rows stay one bucket, as before. Latency-modes remains one row per statement. **Show recurring query templates** (gated on merging) optionally lists multi-member shapes with a ranked `queryid` list that follows the column you sort by (YSQL keeps the same **dbname** split as the Top 25). Membership for Latency-modes templates is taken from every analyzed statement so min-tier / flagged-only filters do not rewrite a template. YCQL uses `?` binds, so the `$N` step never fires, and CQL has no multi-row `VALUES` lists; it still gets `IN (...)` collapsing, comment stripping, and single-row `VALUES (...)` canonicalization (which merges literal inserts). Grouping and family indexes are browser-only; the CLI and viewer apply the same query-normalization rules, and the snapshot format is unchanged.
+
+### Changed
+
+- **Query-template normalization (CLI + viewer):** `normalize_query_template` (and the matching browser function) now also collapses a bulk **`VALUES (...),(...),…`** row-list — any number of rows, one level of nested parens allowed per row for casts/function calls — to a canonical **`VALUES (...)`**. This folds multi-row upserts/bulk updates such as `UPDATE t AS x SET … FROM (VALUES (...)) WHERE …` into a single template regardless of row count, affecting Latency-modes template grouping and the new statement/ASH panel grouping. Per-call `/* … */` comments are still stripped, but planner hints that start with **`/*+`** are preserved so distinct hint sets stay distinct templates. See **Query normalization** in the README for the full step list and before/after examples.
+- **`IN (...)` normalization now skips subqueries:** only a **value-list** `IN (...)` (literals / `$N`) is collapsed; a subquery **`IN (SELECT …)`** (e.g. `DELETE FROM t WHERE c IN (SELECT c FROM t WHERE …)`) is left intact so semantically distinct subquery predicates no longer fold into the same template.
+
 ## [0.1.12] — 2026-08-11
 
 ### Added

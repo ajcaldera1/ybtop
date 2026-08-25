@@ -270,19 +270,34 @@ def apply_bh_correction(results: list[dict[str, Any]], q: float = 0.05) -> dict[
     return {"m": m, "q": q, "downgraded": downgraded}
 
 
-_REWRITE_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
-_IN_LIST_RE = re.compile(r"\bIN\s*\([^)]*\)", re.I)
+# Strip /* ... */ comments except planner hints (pg_hint_plan / YSQL /*+ ... */), which can
+# change the chosen plan and must keep templates distinct.
+_REWRITE_COMMENT_RE = re.compile(r"/\*(?!\+).*?\*/", re.S)
+# Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
+_IN_LIST_RE = re.compile(r"\bIN\s*\((?!\s*SELECT\b)[^)]*\)", re.I)
+# A VALUES row-list (one or more parenthesized rows, each allowing one level of nested parens for
+# casts/function calls). Collapses bulk `VALUES (...),(...),...` — e.g. `UPDATE ... FROM (VALUES
+# (...))` — to a single canonical `VALUES (...)` so a variable row count folds into one template.
+_VALUES_LIST_RE = re.compile(
+    r"\bVALUES\s*\((?:[^()]|\([^()]*\))*\)(?:\s*,\s*\((?:[^()]|\([^()]*\))*\))*",
+    re.I,
+)
 _PLACEHOLDER_RE = re.compile(r"\$\d+")
 _WS_RE = re.compile(r"\s+")
 
 
 def normalize_query_template(query: Optional[str]) -> str:
-    """Collapse a query into a template that ignores per-call comments and IN-list arity.
+    """Collapse a query into a template that ignores per-call comments, IN-list length, and VALUES row count.
 
-    1. Strip embedded per-call comments (e.g. ``/*rewritten_pid='123'*/``).
-    2. Collapse any ``IN (...)`` list (literals or ``$N``) to a canonical ``IN (...)``.
-    3. Collapse remaining ``$N`` placeholders (positions shift after step 2) to ``$N``.
-    4. Collapse whitespace.
+    1. Strip embedded per-call comments (e.g. ``/*rewritten_pid='123'*/``). Planner hints
+       that start with ``/*+`` (pg_hint_plan / YSQL) are preserved so distinct hint sets stay
+       distinct templates.
+    2. Collapse a value-list ``IN (...)`` (literals or ``$N``) to a canonical ``IN (...)``;
+       a subquery ``IN (SELECT ...)`` is left untouched.
+    3. Collapse a ``VALUES (...),(...),...`` row-list (any number of rows) to a canonical
+       ``VALUES (...)`` — e.g. ``UPDATE t AS x SET ... FROM (VALUES (...)) WHERE ...``.
+    4. Collapse remaining ``$N`` placeholders (positions shift after steps 2-3) to ``$N``.
+    5. Collapse whitespace.
 
     Table/column names are preserved, so different predicate/projection columns stay distinct.
     """
@@ -290,6 +305,7 @@ def normalize_query_template(query: Optional[str]) -> str:
         return ""
     q = _REWRITE_COMMENT_RE.sub("", str(query))
     q = _IN_LIST_RE.sub("IN (...)", q)
+    q = _VALUES_LIST_RE.sub("VALUES (...)", q)
     q = _PLACEHOLDER_RE.sub("$N", q)
     q = _WS_RE.sub(" ", q).strip()
     return q
