@@ -184,10 +184,22 @@
     return v === "f" || v === "false" || v === "0";
   }
 
+  /**
+   * Merge similar SQL as a user preference. While a canonical-family ASH report
+   * forces the live switch on, the held value is what belongs in the URL and in
+   * copied links — `canonicalize=t` already means grouping is on for that view.
+   */
+  function mergeSimilarSqlForUrl() {
+    return mergeSimilarSqlSavedForFamily !== null
+      ? mergeSimilarSqlSavedForFamily
+      : mergeSimilarSql;
+  }
+
   /** Non-default UI toggles. Omitted when they match the viewer defaults. */
   function applyViewerToggleParams(p) {
-    if (mergeSimilarSql) p.set("merge", "t");
-    if (mergeSimilarSql && showRecurringTemplates) p.set("templates", "t");
+    const mergePref = mergeSimilarSqlForUrl();
+    if (mergePref) p.set("merge", "t");
+    if (mergePref && showRecurringTemplates) p.set("templates", "t");
     if (latencyFlaggedOnly) p.set("flagged", "t");
     if (!latencyShowDipP) p.set("dip_p", "f");
     if (latencyMinTier && latencyMinTier !== LATENCY_MIN_TIER_DEFAULT) {
@@ -336,6 +348,7 @@
     applyViewerToggleParams(p);
     const qs = p.toString();
     const newUrl = `${window.location.pathname}${qs ? "?" + qs : ""}${window.location.hash || ""}`;
+    const mergePref = mergeSimilarSqlForUrl();
     const st = {
       ybtop: true,
       view: activeViewerSection,
@@ -345,8 +358,8 @@
       dbname: ashCanonicalDbnameFilter || null,
       node: ashNodeIdFilter || null,
       table_id: ashTableIdFilter || null,
-      merge: mergeSimilarSql,
-      templates: !!(mergeSimilarSql && showRecurringTemplates),
+      merge: mergePref,
+      templates: !!(mergePref && showRecurringTemplates),
       flagged: latencyFlaggedOnly,
       dip_p: latencyShowDipP,
       min_tier: latencyMinTier,
@@ -4718,7 +4731,7 @@
       buildShowRecurringTemplatesControl(mergeSimilarSql && showRecurringTemplates, (v) => {
         showRecurringTemplates = v;
         writeViewerStateToUrl();
-        rerender();
+        if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
       })
     );
 
@@ -6210,10 +6223,20 @@
       readViewerStateFromUrl();
       // A history entry may point at a different window (e.g. ASH deep-link);
       // load it rather than just re-rendering the current snapshot.
-      const target = indexForWindowKey(urlWindowKey);
-      if (target >= 0 && target !== currentIndex) {
-        showSnapshotAt(target);
-        return;
+      // No `t` means "follow the newest" — do not leave an older window on
+      // screen and then let renderDoc pin that older time onto this entry.
+      const newest = manifestEntries.length ? manifestEntries.length - 1 : -1;
+      if (!urlWindowKey) {
+        if (newest >= 0 && currentIndex !== newest) {
+          showSnapshotAt(newest);
+          return;
+        }
+      } else {
+        const target = indexForWindowKey(urlWindowKey);
+        if (target >= 0 && target !== currentIndex) {
+          showSnapshotAt(target);
+          return;
+        }
       }
       if (lastDoc) {
         renderDoc(lastDoc, lastPrevDoc);
